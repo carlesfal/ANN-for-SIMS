@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const config = require('../config');
+const { sanitizeJobId } = require('../middleware/validation');
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -26,7 +27,9 @@ exports.batchPredict = async (req, res) => {
       return res.status(400).json({ error: 'Invalid modelJobId format' });
     }
 
-    const modelDir = path.join(config.modelsDir, modelJobId);
+    // Sanitize at point of use for defense-in-depth
+    const safeModelJobId = sanitizeJobId(modelJobId);
+    const modelDir = path.join(config.modelsDir, safeModelJobId);
     if (!fs.existsSync(modelDir)) {
       return res.status(404).json({ error: 'Model not found for the specified job' });
     }
@@ -90,7 +93,9 @@ exports.singlePredict = async (req, res) => {
       return res.status(400).json({ error: 'Invalid modelJobId format' });
     }
 
-    const modelDir = path.join(config.modelsDir, modelJobId);
+    // Sanitize at point of use for defense-in-depth
+    const safeModelJobId = sanitizeJobId(modelJobId);
+    const modelDir = path.join(config.modelsDir, safeModelJobId);
     if (!fs.existsSync(modelDir)) {
       return res.status(404).json({ error: 'Model not found for the specified job' });
     }

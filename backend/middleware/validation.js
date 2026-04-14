@@ -19,6 +19,20 @@ function validateJobId(req, res, next) {
 }
 
 /**
+ * Sanitize a job ID to its UUID form, stripping any unexpected characters.
+ * Call this at the point of path construction for defense-in-depth.
+ * @param {string} id
+ * @returns {string}
+ */
+function sanitizeJobId(id) {
+  if (!id || !UUID_REGEX.test(id)) {
+    throw new Error('Invalid job ID');
+  }
+  // Return only the matched UUID characters (strips surrounding whitespace etc.)
+  return id.match(UUID_REGEX)[0].toLowerCase();
+}
+
+/**
  * Rate limiter for API routes — 100 requests per 15 minutes per IP.
  */
 const apiRateLimiter = rateLimit({
@@ -41,4 +55,4 @@ const heavyRateLimiter = rateLimit({
   message: { error: 'Too many training/prediction requests, please try again later.' },
 });
 
-module.exports = { validateJobId, apiRateLimiter, heavyRateLimiter };
+module.exports = { validateJobId, sanitizeJobId, apiRateLimiter, heavyRateLimiter };
