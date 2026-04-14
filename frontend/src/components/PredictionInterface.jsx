@@ -49,7 +49,7 @@ export default function PredictionInterface({ mode }) {
     try {
       features = JSON.parse(singleFeatures);
     } catch (err) {
-      setError('Invalid JSON for features. Example: {"feature1": 1.5, "feature2": 3.2}');
+      setError(`Invalid JSON for features: ${err.message}. Example: {"feature1": 1.5, "feature2": 3.2}`);
       return;
     }
 

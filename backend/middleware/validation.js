@@ -55,4 +55,4 @@ const heavyRateLimiter = rateLimit({
   message: { error: 'Too many training/prediction requests, please try again later.' },
 });
 
-module.exports = { validateJobId, sanitizeJobId, apiRateLimiter, heavyRateLimiter };
+module.exports = { validateJobId, sanitizeJobId, UUID_REGEX, apiRateLimiter, heavyRateLimiter };

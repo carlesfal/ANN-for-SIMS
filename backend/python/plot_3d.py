@@ -30,8 +30,7 @@ def generate_3d_plots(model, scaler_X, scaler_y, X_data, y_data, feature_columns
 
     # Limit pairs to avoid too many plots
     feature_pairs = list(itertools.combinations(range(n_features), 2))
-    max_plots = 6
-    feature_pairs = feature_pairs[:max_plots]
+    feature_pairs = feature_pairs[:cfg.MAX_3D_PLOTS]
 
     X_mean = np.mean(X_data, axis=0)
     X_min = np.min(X_data, axis=0)

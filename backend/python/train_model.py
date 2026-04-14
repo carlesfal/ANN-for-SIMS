@@ -246,7 +246,7 @@ def train_final_model(X, y, best_params, epochs, batch_size, patience, output_di
         except ValueError:
             pass
 
-    val_split = min(cfg.MIN_VALIDATION_SPLIT, cfg.MIN_VALIDATION_SAMPLES / len(X)) if len(X) > cfg.LARGE_DATASET_THRESHOLD else cfg.MIN_VALIDATION_SPLIT
+    val_split = max(cfg.MIN_VALIDATION_SPLIT, cfg.MIN_VALIDATION_SAMPLES / len(X)) if len(X) > cfg.LARGE_DATASET_THRESHOLD else cfg.MIN_VALIDATION_SPLIT
     callbacks = [
         tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=patience // 2, min_lr=1e-6),

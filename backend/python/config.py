@@ -47,6 +47,9 @@ MIN_VALIDATION_SAMPLES = 50         # Below this, use MIN_VALIDATION_SPLIT uncon
 LARGE_DATASET_THRESHOLD = 100       # Samples threshold for adaptive validation split
 FALLBACK_UNCERTAINTY_FACTOR = 0.05  # Fraction of prediction range used as PI when no dropout
 
+# Maximum number of 3D surface plots to generate (limits pairs of features)
+MAX_3D_PLOTS = 6
+
 # Log history limit (max recent log entries returned per status call)
 MAX_LOGS_RETURNED = 50
 

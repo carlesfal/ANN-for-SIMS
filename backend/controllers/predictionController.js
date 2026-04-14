@@ -3,9 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const config = require('../config');
-const { sanitizeJobId } = require('../middleware/validation');
-
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Import sanitizeJobId and UUID_REGEX from validation module — single source of truth
+const { sanitizeJobId, UUID_REGEX } = require('../middleware/validation');
 
 function validateModelJobId(modelJobId) {
   return modelJobId && UUID_REGEX.test(modelJobId);

@@ -78,8 +78,8 @@ def compute_metrics(y_true, y_pred):
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
 
-    # MAPE - avoid division by zero
-    mask = y_true != 0
+    # MAPE — use epsilon threshold to avoid division by near-zero values
+    mask = np.abs(y_true) > 1e-10
     if mask.sum() > 0:
         mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
     else:
