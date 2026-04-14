@@ -83,7 +83,7 @@ export default function TrainingMonitor({ jobId, onReset }) {
     );
   }
 
-  const { status, progress = 0, currentFold, currentEpoch, metrics, statusMessage, startedAt, completedAt, error: jobError } = jobStatus;
+  const { status, progress = 0, currentFold, metrics, statusMessage, startedAt, completedAt, error: jobError } = jobStatus;
   const isTerminal = ['completed', 'failed', 'cancelled'].includes(status);
 
   return (

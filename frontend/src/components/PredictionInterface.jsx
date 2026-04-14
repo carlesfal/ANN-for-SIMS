@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import DataUploader from './DataUploader.jsx';
-import { predictionsApi, trainingApi } from '../services/api.js';
+import { predictionsApi } from '../services/api.js';
 import { formatNumber } from '../utils/formatters.js';
 
 export default function PredictionInterface({ mode }) {

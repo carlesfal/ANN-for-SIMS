@@ -4,7 +4,7 @@ import {
   CategoryScale, LinearScale, PointElement, LineElement,
   BarElement, Title, Tooltip, Legend, Filler,
 } from 'chart.js';
-import { Scatter, Bar, Line } from 'react-chartjs-2';
+import { Scatter, Bar } from 'react-chartjs-2';
 import { formatMetric, formatNumber } from '../utils/formatters.js';
 
 ChartJS.register(

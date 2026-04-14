@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { trainingApi, resultsApi } from '../services/api.js';
 import MetricsDisplay from '../components/MetricsDisplay.jsx';
 import Plot3DViewer from '../components/Plot3DViewer.jsx';
 import DownloadManager from '../components/DownloadManager.jsx';
-import { formatDate, formatDuration, formatStatus, formatDateShort } from '../utils/formatters.js';
+import { formatStatus, formatDateShort } from '../utils/formatters.js';
 
 export default function Results() {
   const { jobId: paramJobId } = useParams();
@@ -16,17 +16,7 @@ export default function Results() {
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState('metrics');
 
-  useEffect(() => {
-    loadJobs();
-  }, []);
-
-  useEffect(() => {
-    if (selectedJobId) {
-      loadResults(selectedJobId);
-    }
-  }, [selectedJobId]);
-
-  const loadJobs = async () => {
+  const loadJobs = useCallback(async () => {
     try {
       const data = await trainingApi.listJobs();
       setJobs(data.jobs || []);
@@ -37,9 +27,13 @@ export default function Results() {
     } catch (err) {
       console.error('Failed to load jobs:', err.message);
     }
-  };
+  }, [selectedJobId]);
 
-  const loadResults = async (jobId) => {
+  useEffect(() => {
+    loadJobs();
+  }, [loadJobs]);
+
+  const loadResults = useCallback(async (jobId) => {
     setLoading(true);
     setError('');
     setResults(null);
@@ -56,7 +50,13 @@ export default function Results() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (selectedJobId) {
+      loadResults(selectedJobId);
+    }
+  }, [selectedJobId, loadResults]);
 
   return (
     <div>
