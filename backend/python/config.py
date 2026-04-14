@@ -41,6 +41,15 @@ BOOTSTRAP_N_ITERATIONS = 100
 # Random seed for reproducibility
 RANDOM_SEED = 42
 
+# Validation split thresholds
+MIN_VALIDATION_SPLIT = 0.1          # Minimum validation fraction for final model training
+MIN_VALIDATION_SAMPLES = 50         # Below this, use MIN_VALIDATION_SPLIT unconditionally
+LARGE_DATASET_THRESHOLD = 100       # Samples threshold for adaptive validation split
+FALLBACK_UNCERTAINTY_FACTOR = 0.05  # Fraction of prediction range used as PI when no dropout
+
+# Log history limit (max recent log entries returned per status call)
+MAX_LOGS_RETURNED = 50
+
 # File names
 MODEL_FILENAME = "best_model.h5"
 SCALER_X_FILENAME = "scaler_X.pkl"

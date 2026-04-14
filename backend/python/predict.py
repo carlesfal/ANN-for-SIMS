@@ -67,7 +67,7 @@ def predict_with_intervals(model, scaler_X, scaler_y, X, n_bootstrap=cfg.BOOTSTR
 
         # Estimate uncertainty as a fraction of prediction range
         pred_range = y_pred.max() - y_pred.min() if y_pred.max() != y_pred.min() else 1.0
-        uncertainty = pred_range * 0.05  # 5% of range as rough PI
+        uncertainty = pred_range * cfg.FALLBACK_UNCERTAINTY_FACTOR
         y_lower = y_pred - cfg.PI_Z_SCORE * uncertainty
         y_upper = y_pred + cfg.PI_Z_SCORE * uncertainty
 

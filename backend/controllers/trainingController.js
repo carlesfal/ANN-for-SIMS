@@ -214,7 +214,7 @@ exports.getStatus = (req, res) => {
     currentEpoch: job.currentEpoch,
     metrics: job.metrics,
     statusMessage: job.statusMessage,
-    logs: (job.logs || []).slice(-50),
+    logs: (job.logs || []).slice(-50), // Return last 50 log entries
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,

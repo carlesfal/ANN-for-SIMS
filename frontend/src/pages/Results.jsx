@@ -4,7 +4,7 @@ import { trainingApi, resultsApi } from '../services/api.js';
 import MetricsDisplay from '../components/MetricsDisplay.jsx';
 import Plot3DViewer from '../components/Plot3DViewer.jsx';
 import DownloadManager from '../components/DownloadManager.jsx';
-import { formatDate, formatDuration, formatStatus } from '../utils/formatters.js';
+import { formatDate, formatDuration, formatStatus, formatDateShort } from '../utils/formatters.js';
 
 export default function Results() {
   const { jobId: paramJobId } = useParams();
@@ -106,7 +106,7 @@ export default function Results() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'space-between' }}>
                     <span className={`badge badge-${job.status}`}>{formatStatus(job.status)}</span>
                     <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
-                      {formatDate(job.createdAt).split(',')[0]}
+                      {formatDateShort(job.createdAt)}
                     </span>
                   </div>
                 </button>

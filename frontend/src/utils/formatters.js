@@ -51,6 +51,18 @@ export function formatDate(dateString) {
 }
 
 /**
+ * Format a date showing only the date portion (locale-independent).
+ */
+export function formatDateShort(dateString) {
+  if (!dateString) return '—';
+  return new Date(dateString).toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+/**
  * Format elapsed time in human-readable form.
  */
 export function formatDuration(startIso, endIso) {

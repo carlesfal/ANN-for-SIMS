@@ -4,6 +4,12 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const config = require('../config');
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function validateModelJobId(modelJobId) {
+  return modelJobId && UUID_REGEX.test(modelJobId);
+}
+
 exports.batchPredict = async (req, res) => {
   try {
     if (!req.file) {
@@ -14,6 +20,10 @@ exports.batchPredict = async (req, res) => {
 
     if (!modelJobId) {
       return res.status(400).json({ error: 'modelJobId is required' });
+    }
+
+    if (!validateModelJobId(modelJobId)) {
+      return res.status(400).json({ error: 'Invalid modelJobId format' });
     }
 
     const modelDir = path.join(config.modelsDir, modelJobId);
@@ -74,6 +84,10 @@ exports.singlePredict = async (req, res) => {
 
     if (!modelJobId || !features) {
       return res.status(400).json({ error: 'modelJobId and features are required' });
+    }
+
+    if (!validateModelJobId(modelJobId)) {
+      return res.status(400).json({ error: 'Invalid modelJobId format' });
     }
 
     const modelDir = path.join(config.modelsDir, modelJobId);
