@@ -9,6 +9,7 @@ const config = require('./config');
 const trainingRoutes = require('./routes/training');
 const predictionRoutes = require('./routes/predictions');
 const resultsRoutes = require('./routes/results');
+const templateRoutes = require('./routes/template');
 const { attachWebSocketServer } = require('./utils/jobQueue');
 
 const app = express();
@@ -42,6 +43,7 @@ app.get('/health', (req, res) => {
 app.use('/api/training', trainingRoutes);
 app.use('/api/predictions', predictionRoutes);
 app.use('/api/results', resultsRoutes);
+app.use('/api/template', templateRoutes);
 
 // 404 handler
 app.use((req, res) => {

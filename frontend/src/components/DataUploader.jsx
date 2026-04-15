@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import TemplateDownloader from './TemplateDownloader.jsx';
 
 export default function DataUploader({ onFileSelected }) {
   const [dragOver, setDragOver] = useState(false);
@@ -114,6 +115,13 @@ export default function DataUploader({ onFileSelected }) {
             <li>Missing values (NaN) will be automatically removed</li>
           </ul>
         </div>
+      </div>
+
+      <div style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+          Need a starting point?
+        </span>
+        <TemplateDownloader />
       </div>
     </div>
   );

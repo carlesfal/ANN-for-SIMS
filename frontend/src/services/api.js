@@ -59,6 +59,12 @@ export const resultsApi = {
     `${BASE_URL}/api/results/${jobId}/download?format=${format}`,
 };
 
+// Template API
+export const templateApi = {
+  downloadUrl: ({ labels = 1, inputs = 3, outputs = 1 } = {}) =>
+    `${BASE_URL}/api/template/download?labels=${labels}&inputs=${inputs}&outputs=${outputs}`,
+};
+
 // Health check
 export const healthApi = {
   check: () => axios.get(`${BASE_URL}/health`).then((r) => r.data),
