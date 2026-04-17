@@ -1,0 +1,80 @@
+# docker-compose.yml  —  also works with podman-compose (see podman-compose.yml)
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Containerfile
+    container_name: ann-sims-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/models:/app/models
+      - ./backend/results:/app/results
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - FRONTEND_URL=http://localhost:3000
+      - USE_TF_SERVING=true
+      - TF_SERVING_URL=http://tf-serving:8501
+    depends_on:
+      - tf-serving
+    restart: unless-stopped
+    networks:
+      - ann-sims-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Containerfile
+    container_name: ann-sims-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_BASE_URL=http://localhost:5000
+    restart: unless-stopped
+    networks:
+      - ann-sims-network
+
+  tf-serving:
+    image: tensorflow/serving:2.14.0
+    container_name: ann-sims-tf-serving
+    ports:
+      - "8501:8501"
+      - "8500:8500"
+    volumes:
+      - ./backend/models:/models
+      - ./backend/models/models.config:/etc/tf_serving/models.config
+    environment:
+      - MODEL_CONFIG_FILE=/etc/tf_serving/models.config
+      - MODEL_CONFIG_FILE_POLL_WAIT_SECONDS=60
+    command: >
+      --rest_api_port=8501
+      --model_config_file=/etc/tf_serving/models.config
+      --model_config_file_poll_wait_seconds=60
+      --allow_version_labels_for_unavailable_models=true
+    restart: unless-stopped
+    networks:
+      - ann-sims-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: ann-sims-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    networks:
+      - ann-sims-network
+
+networks:
+  ann-sims-network:
+    driver: bridge
