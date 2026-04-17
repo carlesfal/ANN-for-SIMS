@@ -1,0 +1,49 @@
+# ── Stage 1: Install Node.js dependencies ────────────────────────────────────
+FROM docker.io/library/node:18-slim AS node-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# ── Stage 2: Install Python dependencies ─────────────────────────────────────
+FROM docker.io/library/python:3.11-slim AS python-deps
+WORKDIR /deps
+COPY python/requirements.txt ./
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ── Stage 3: Production image ─────────────────────────────────────────────────
+FROM docker.io/library/node:18-slim
+
+# Install Python runtime (no pip/dev headers needed)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy Node.js production dependencies
+COPY --from=node-deps /app/node_modules ./node_modules
+
+# Copy Python packages installed in stage 2
+COPY --from=python-deps /install /usr/local
+
+# Copy application source
+COPY . .
+
+# Create runtime directories (volumes will mount over them)
+RUN mkdir -p uploads models results
+
+# Non-root user for security
+RUN groupadd -r annsims && useradd -r -g annsims -d /app annsims && \
+    chown -R annsims:annsims /app
+USER annsims
+
+ENV NODE_ENV=production \
+    PORT=5000 \
+    PYTHON_EXECUTABLE=python3
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:5000/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"
+
+CMD ["node", "server.js"]

@@ -70,6 +70,45 @@ docker-compose up --build
 - Backend API: `http://localhost:5000`
 - Full stack via Nginx: `http://localhost:80`
 
+## Podman Setup
+
+Install [podman-compose](https://github.com/containers/podman-compose) if you
+haven't already:
+
+```bash
+pip install podman-compose        # or: dnf install podman-compose
+```
+
+Then run:
+
+```bash
+podman-compose -f podman-compose.yml up --build
+```
+
+To build and run individual containers with plain Podman:
+
+```bash
+# Backend
+podman build -t ann-sims-backend -f backend/Containerfile backend/
+podman run -d -p 5000:5000 \
+  -v ./backend/uploads:/app/uploads:Z \
+  -v ./backend/models:/app/models:Z \
+  -v ./backend/results:/app/results:Z \
+  --name ann-sims-backend ann-sims-backend
+
+# Frontend
+podman build -t ann-sims-frontend -f frontend/Containerfile frontend/
+podman run -d -p 3000:80 --name ann-sims-frontend ann-sims-frontend
+```
+
+> **Note:** The `Containerfile` is the Podman-native equivalent of a
+> `Dockerfile`.  Both `docker build` and `podman build` can consume either
+> filename, so the same images work with both runtimes.
+
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:5000`
+- Full stack via Nginx: `http://localhost:80`
+
 ---
 
 ## Environment Variables

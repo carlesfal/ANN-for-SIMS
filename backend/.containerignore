@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log*
+.env
+.env.*
+coverage
+tests
+.git
+.gitignore
+*.md
+kt_dir
+__pycache__
+*.pyc
+uploads/*
+models/*
+results/*
+.vscode
+.idea

@@ -61,6 +61,16 @@ Open [http://localhost:3000](http://localhost:3000)
 docker-compose up --build
 ```
 
+### Podman
+
+```bash
+podman-compose -f podman-compose.yml up --build
+```
+
+> Both `docker-compose.yml` and `podman-compose.yml` are provided.
+> The Podman variant uses fully-qualified image references (`docker.io/…`)
+> and SELinux-aware volume labels (`:Z`).
+
 ## Documentation
 
 - [Setup Guide](docs/SETUP.md) — Detailed installation instructions
