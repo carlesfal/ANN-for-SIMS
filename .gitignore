@@ -79,6 +79,7 @@ backend/uploads/*
 !backend/uploads/.gitkeep
 backend/models/*
 !backend/models/.gitkeep
+!backend/models/models.config
 backend/results/*
 !backend/results/.gitkeep
 

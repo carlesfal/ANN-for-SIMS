@@ -50,6 +50,12 @@ exports.batchPredict = async (req, res) => {
       args.push('--feature-columns', featureColumns);
     }
 
+    // Delegate inference to TensorFlow Serving when enabled
+    if (config.useTfServing) {
+      args.push('--use-tf-serving', '--tf-serving-url', config.tfServingUrl,
+                '--model-name', safeModelJobId);
+    }
+
     await new Promise((resolve, reject) => {
       const proc = spawn(config.pythonExecutable, args, {
         env: { ...process.env, PYTHONUNBUFFERED: '1' },
@@ -107,6 +113,12 @@ exports.singlePredict = async (req, res) => {
       '--single',
       '--input-json', inputData,
     ];
+
+    // Delegate inference to TensorFlow Serving when enabled
+    if (config.useTfServing) {
+      args.push('--use-tf-serving', '--tf-serving-url', config.tfServingUrl,
+                '--model-name', safeModelJobId);
+    }
 
     let stdout = '';
     let stderr = '';

@@ -2,6 +2,8 @@
 ML configuration and hyperparameter defaults for the ANN-SIMS pipeline.
 """
 
+import os
+
 # Default training hyperparameters
 DEFAULT_EPOCHS = 100
 DEFAULT_FOLDS = 10
@@ -55,8 +57,13 @@ MAX_LOGS_RETURNED = 50
 
 # File names
 MODEL_FILENAME = "best_model.h5"
+SAVEDMODEL_DIR = "savedmodel"          # TF SavedModel sub-directory (version 1)
 SCALER_X_FILENAME = "scaler_X.pkl"
 SCALER_Y_FILENAME = "scaler_y.pkl"
 RESULTS_FILENAME = "results.json"
 PREDICTIONS_FILENAME = "predictions.json"
 PRETRAIN_WEIGHTS_FILENAME = "pretrain_weights.h5"
+
+# TensorFlow Serving
+TF_SERVING_URL = os.environ.get("TF_SERVING_URL", "http://localhost:8501")
+TF_SERVING_TIMEOUT = 10  # seconds

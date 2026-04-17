@@ -12,4 +12,7 @@ module.exports = {
   allowedFileTypes: ['.csv', '.xlsx', '.xls'],
   jobTimeoutMs: 30 * 60 * 1000, // 30 minutes
   wsHeartbeatInterval: 30000,
+  // TensorFlow Serving
+  tfServingUrl: process.env.TF_SERVING_URL || 'http://localhost:8501',
+  useTfServing: process.env.USE_TF_SERVING === 'true',
 };

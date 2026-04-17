@@ -153,6 +153,9 @@ function _spawnTrainingProcess(jobId, filePath, outputDir, params) {
         results,
       });
       console.log(`[TRAINING][${jobId}] Completed successfully`);
+
+      // Regenerate TF Serving model config so the new model is discoverable
+      _regenerateTfServingConfig();
     } else {
       updateJob(jobId, {
         status: 'failed',
@@ -196,6 +199,30 @@ function _handleProgressLine(jobId, line) {
   }
 
   updateJob(jobId, updates);
+}
+
+/**
+ * Regenerate the TF Serving model_config_list file by invoking the
+ * export_savedmodel.py helper.  Runs fire-and-forget — a failure here
+ * does not affect the training result.
+ */
+function _regenerateTfServingConfig() {
+  const scriptPath = path.join(config.pythonDir, 'export_savedmodel.py');
+  const proc = spawn(config.pythonExecutable, [
+    scriptPath,
+    '--models-root', config.modelsDir,
+    '--generate-config',
+  ]);
+  proc.on('close', (code) => {
+    if (code === 0) {
+      console.log('[TF-SERVING] Model config regenerated successfully');
+    } else {
+      console.warn(`[TF-SERVING] Config regeneration exited with code ${code}`);
+    }
+  });
+  proc.on('error', (err) => {
+    console.warn('[TF-SERVING] Config regeneration failed:', err.message);
+  });
 }
 
 exports.getStatus = (req, res) => {

@@ -267,6 +267,12 @@ def train_final_model(X, y, best_params, epochs, batch_size, patience, output_di
     model.save(model_path)
     save_scalers(scaler_X, scaler_y, model_dir)
 
+    # Also export in TF SavedModel format for TensorFlow Serving
+    savedmodel_path = os.path.join(model_dir, cfg.SAVEDMODEL_DIR, '1')
+    os.makedirs(savedmodel_path, exist_ok=True)
+    model.save(savedmodel_path, save_format='tf')
+    log_status(f"SavedModel exported to {savedmodel_path}")
+
     log_status(f"Final model saved to {model_path}")
     log_progress(95)
 
@@ -357,6 +363,14 @@ def main():
         src = os.path.join(args.output_dir, fname)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(models_dir, fname))
+
+    # Copy SavedModel directory to models_dir for TF Serving
+    src_savedmodel = os.path.join(args.output_dir, cfg.SAVEDMODEL_DIR)
+    dst_savedmodel = os.path.join(models_dir, cfg.SAVEDMODEL_DIR)
+    if os.path.isdir(src_savedmodel):
+        if os.path.isdir(dst_savedmodel):
+            shutil.rmtree(dst_savedmodel)
+        shutil.copytree(src_savedmodel, dst_savedmodel)
 
     # Save feature columns info
     meta = {'feature_columns': feature_columns, 'target_column': args.target_column}
