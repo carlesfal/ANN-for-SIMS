@@ -889,6 +889,10 @@ kfold_stats_path = os.path.join(EXPORT_DIR, "kfold_summary.csv")
 df_kfold_stats.to_csv(kfold_stats_path, index=False)
 print(f"\n  K-fold summary saved to: {kfold_stats_path}")
 
+kfold_xlsx_path = os.path.join(EXPORT_DIR, "kfold_summary.xlsx")
+df_kfold_stats.to_excel(kfold_xlsx_path, index=False, engine="openpyxl")
+print(f"  K-fold summary (Excel) saved to: {kfold_xlsx_path}")
+
 print("\n" + "="*70)
 print("PHASE 5 DONE")
 print("="*70)
@@ -1179,18 +1183,17 @@ for name, frame in [("results_train.csv", df_train_res),
     frame.to_csv(path, index=False)
     print(f"Saved: {path}")
 
-if use_colab:
-    for fname in ["results_train.csv", "results_val.csv", "results_test.csv",
-                  "kfold_summary.csv",
-                  "final_model.keras", "scaler_X.pkl", "scaler_y.pkl"]:
-        fpath = os.path.join(EXPORT_DIR, fname)
-        try:
-            colab_files.download(fpath)
-        except Exception as e:
-            print(f"Download failed for {fpath}: {e}")
+# --- Export results in Excel format (.xlsx) ---
+xlsx_path = os.path.join(EXPORT_DIR, "results_all.xlsx")
+with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+    df_train_res.to_excel(writer, sheet_name="Train", index=False)
+    df_val_res.to_excel(writer, sheet_name="Validation", index=False)
+    df_test_res.to_excel(writer, sheet_name="Test", index=False)
+    df_kfold_stats.to_excel(writer, sheet_name="KFold_Summary", index=False)
+print(f"Saved: {xlsx_path} (sheets: Train, Validation, Test, KFold_Summary)")
 
 print("\n" + "="*70)
-print("ALL PHASES COMPLETE")
+print("PHASE 8 DONE")
 print("="*70)
 
 # ============================================================
@@ -1417,4 +1420,39 @@ except Exception as e:
 
 print("\n" + "="*70)
 print("PHASE 9 DONE - 3D surface plots generated and exported")
+print("="*70)
+
+# ============================================================
+# DOWNLOAD ALL RESULTS & PLOTS
+# ============================================================
+print("\n" + "="*70)
+print("DOWNLOAD: Collecting all results and plots")
+print("="*70)
+
+# --- List all exported files ---
+_all_export_files = []
+for _root, _dirs, _files in os.walk(EXPORT_DIR):
+    for _f in _files:
+        _all_export_files.append(os.path.join(_root, _f))
+
+print(f"\nFiles in '{EXPORT_DIR}/' ({len(_all_export_files)} total):")
+for _fp in sorted(_all_export_files):
+    _rel = os.path.relpath(_fp, EXPORT_DIR)
+    _sz  = os.path.getsize(_fp)
+    print(f"  {_rel:50s}  ({_sz:>10,} bytes)")
+
+# --- Colab auto-download ---
+if use_colab:
+    print("\nDownloading files to browser...")
+    for _fp in sorted(_all_export_files):
+        try:
+            colab_files.download(_fp)
+            print(f"  Downloaded: {os.path.relpath(_fp, EXPORT_DIR)}")
+        except Exception as e:
+            print(f"  Download failed for {os.path.relpath(_fp, EXPORT_DIR)}: {e}")
+else:
+    print(f"\nAll outputs are in: {os.path.abspath(EXPORT_DIR)}/")
+
+print("\n" + "="*70)
+print("ALL PHASES COMPLETE")
 print("="*70)
