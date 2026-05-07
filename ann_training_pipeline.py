@@ -965,3 +965,231 @@ if use_colab:
 print("\n" + "="*70)
 print("ALL PHASES COMPLETE")
 print("="*70)
+
+# ============================================================
+# PHASE 9: 3D SURFACE PLOTS + EXPORT
+# ============================================================
+print("\n" + "="*70)
+print("PHASE 9: 3D SURFACE PLOTS + EXPORT")
+print("="*70)
+
+from itertools import combinations
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+# ---------------- PLOT USER SETTINGS ----------------
+FEATURE_X = "MnCO3"
+FEATURE_Y = "FeCO3"
+
+GRID_N_SINGLE = 50
+RANGE_MODE = "quantile"
+Q_LOW, Q_HIGH = 0.02, 0.98
+HOLD_MODE = "median_train"
+ROW_INDEX = 0
+
+OVERLAY_TRAIN_SCATTER = True
+SCATTER_ALPHA = 0.25
+SCATTER_SIZE = 10
+
+# Multi-pair settings
+FEATURES_TO_USE = None   # e.g. ["X1","X2","X3"] or [0,1,2] or None
+MAX_PAIRS = 12
+GRID_N_MULTI = 35
+GRID_RANGE_MODE = "train_quantile"
+Q_LOW_MULTI, Q_HIGH_MULTI = 0.02, 0.98
+HOLD_MODE_MULTI = "median_train"
+ROW_INDEX_MULTI = 0
+SCATTER_ALPHA_MULTI = 0.25
+SCATTER_SIZE_MULTI = 8
+
+# Export settings
+GRID_N_EXPORT = 30
+RANGE_MODE_EXPORT = "quantile"
+Q_LOW_EXPORT, Q_HIGH_EXPORT = 0.02, 0.98
+HOLD_MODE_EXPORT = "median_train"
+ROW_INDEX_EXPORT = 0
+DPI = 600
+FIG_WIDTH = 8.3 / 2.54  # 8.3 cm -> inches
+# ------------------------------------------------
+
+if "inputs_columns" not in globals():
+    if "inputs_df" in globals():
+        inputs_columns = list(inputs_df.columns)
+    else:
+        inputs_columns = list(range(X_train_orig.shape[1]))
+
+def _grid_vals(col_idx, grid_n, range_mode, q_low, q_high):
+    v = X_train_orig[:, col_idx]
+    if range_mode == "minmax":
+        lo, hi = float(np.min(v)), float(np.max(v))
+    elif range_mode in ("quantile", "train_quantile"):
+        lo, hi = float(np.quantile(v, q_low)), float(np.quantile(v, q_high))
+    else:
+        raise ValueError(f"range_mode must be 'quantile', 'train_quantile', or 'minmax', got: {range_mode}")
+    if np.isclose(lo, hi):
+        lo, hi = lo - 1.0, hi + 1.0
+    return np.linspace(lo, hi, grid_n)
+
+def predict_from_origX(X_orig_2d):
+    X_scaled = scaler_X.transform(X_orig_2d)
+    y_scaled = model.predict(X_scaled, verbose=0)
+    return scaler_y.inverse_transform(y_scaled).reshape(-1)
+
+def _build_xref(hold_mode, row_index):
+    if hold_mode == "median_train":
+        return np.median(X_train_orig, axis=0)
+    elif hold_mode == "mean_train":
+        return np.mean(X_train_orig, axis=0)
+    elif hold_mode == "row":
+        if row_index < 0 or row_index >= len(X_train_orig):
+            raise IndexError(f"ROW_INDEX out of range: {row_index}")
+        return X_train_orig[row_index].copy()
+    else:
+        raise ValueError("HOLD_MODE must be one of: median_train, mean_train, row")
+
+def _colname(i):
+    return inputs_columns[i] if isinstance(inputs_columns[i], (str, int)) else str(inputs_columns[i])
+
+def _safe_name(s):
+    s = str(s)
+    for ch in [" ", "/", "\\", ":", ";", "|", "(", ")", "[", "]", "{", "}", "%"]:
+        s = s.replace(ch, "_")
+    return s
+
+# ---- Single surface: MnCO3 vs FeCO3 ----
+if FEATURE_X in inputs_columns and FEATURE_Y in inputs_columns:
+    ix = inputs_columns.index(FEATURE_X)
+    iy = inputs_columns.index(FEATURE_Y)
+    Xref = _build_xref(HOLD_MODE, ROW_INDEX)
+
+    x_vals = _grid_vals(ix, GRID_N_SINGLE, RANGE_MODE, Q_LOW, Q_HIGH)
+    y_vals = _grid_vals(iy, GRID_N_SINGLE, RANGE_MODE, Q_LOW, Q_HIGH)
+    XX, YY = np.meshgrid(x_vals, y_vals)
+
+    Xgrid = np.tile(Xref.reshape(1, -1), (XX.size, 1))
+    Xgrid[:, ix] = XX.reshape(-1)
+    Xgrid[:, iy] = YY.reshape(-1)
+
+    Z = predict_from_origX(Xgrid).reshape(XX.shape)
+
+    fig = plt.figure(figsize=(FIG_WIDTH, FIG_WIDTH * 0.85))
+    ax = fig.add_subplot(111, projection="3d")
+    surf = ax.plot_surface(XX, YY, Z, cmap="viridis", linewidth=0, antialiased=True, alpha=0.92)
+    fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Predicted output")
+
+    if OVERLAY_TRAIN_SCATTER:
+        z_train_pred = predict_from_origX(X_train_orig)
+        ax.scatter(X_train_orig[:, ix], X_train_orig[:, iy], z_train_pred, c="k", s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
+
+    ax.set_title(f"Predicted surface: {FEATURE_X} vs {FEATURE_Y}\n(others held constant: {HOLD_MODE})")
+    ax.set_xlabel(FEATURE_X)
+    ax.set_ylabel(FEATURE_Y)
+    ax.set_zlabel("Predicted output")
+    ax.view_init(elev=25, azim=-135)
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+else:
+    print(f"Skipping MnCO3 vs FeCO3 plot: features not found in {inputs_columns}")
+
+# ---- Multi-pair surfaces ----
+n_features = X_train_orig.shape[1]
+if FEATURES_TO_USE is None:
+    feat_indices = list(range(n_features))
+else:
+    feat_indices = []
+    for f in FEATURES_TO_USE:
+        if isinstance(f, int):
+            feat_indices.append(f)
+        else:
+            if f not in inputs_columns:
+                raise ValueError(f"Feature name '{f}' not in inputs_columns.")
+            feat_indices.append(inputs_columns.index(f))
+
+feat_indices = [i for i in feat_indices if 0 <= i < n_features]
+if len(feat_indices) >= 2:
+    pairs = list(combinations(feat_indices, 2))[:MAX_PAIRS]
+    Xref_multi = _build_xref(HOLD_MODE_MULTI, ROW_INDEX_MULTI)
+
+    print(f"Plotting {len(pairs)} 3D surfaces; HOLD_MODE={HOLD_MODE_MULTI}, GRID_N={GRID_N_MULTI}, RANGE={GRID_RANGE_MODE}")
+
+    if OVERLAY_TRAIN_SCATTER:
+        y_train_pred_vis = predict_from_origX(X_train_orig)
+
+    for (i, j) in pairs:
+        xi_vals = _grid_vals(i, GRID_N_MULTI, GRID_RANGE_MODE, Q_LOW_MULTI, Q_HIGH_MULTI)
+        xj_vals = _grid_vals(j, GRID_N_MULTI, GRID_RANGE_MODE, Q_LOW_MULTI, Q_HIGH_MULTI)
+        XI, XJ = np.meshgrid(xi_vals, xj_vals)
+
+        Xgrid = np.tile(Xref_multi.reshape(1, -1), (XI.size, 1))
+        Xgrid[:, i] = XI.reshape(-1)
+        Xgrid[:, j] = XJ.reshape(-1)
+
+        Y = predict_from_origX(Xgrid).reshape(XI.shape)
+
+        fig = plt.figure(figsize=(FIG_WIDTH, FIG_WIDTH * 0.85))
+        ax = fig.add_subplot(111, projection="3d")
+        surf = ax.plot_surface(XI, XJ, Y, cmap="viridis", linewidth=0, antialiased=True, alpha=0.9)
+        fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Predicted output")
+
+        if OVERLAY_TRAIN_SCATTER:
+            ax.scatter(X_train_orig[:, i], X_train_orig[:, j], y_train_pred_vis, c="k", s=SCATTER_SIZE_MULTI, alpha=SCATTER_ALPHA_MULTI)
+
+        ax.set_title(f"Predicted surface: {_colname(i)} vs {_colname(j)}\n(others held constant: {HOLD_MODE_MULTI})")
+        ax.set_xlabel(str(_colname(i)))
+        ax.set_ylabel(str(_colname(j)))
+        ax.set_zlabel("Predicted output")
+        ax.view_init(elev=25, azim=-135)
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+else:
+    print("Need at least 2 features to plot multi-pair 3D surfaces.")
+
+# ---- Export ALL 3D surfaces to PNG ----
+try:
+    plots_dir_3d = os.path.join(EXPORT_DIR, "plots_3d")
+    os.makedirs(plots_dir_3d, exist_ok=True)
+
+    p3d = X_train_orig.shape[1]
+    Xref_3d = _build_xref(HOLD_MODE_EXPORT, ROW_INDEX_EXPORT)
+    pairs_3d = list(combinations(range(p3d), 2))
+    print(f"\nGenerating {len(pairs_3d)} 3D surfaces into: {plots_dir_3d}")
+
+    for (i, j) in pairs_3d:
+        xi = _grid_vals(i, GRID_N_EXPORT, RANGE_MODE_EXPORT, Q_LOW_EXPORT, Q_HIGH_EXPORT)
+        xj = _grid_vals(j, GRID_N_EXPORT, RANGE_MODE_EXPORT, Q_LOW_EXPORT, Q_HIGH_EXPORT)
+        XI, XJ = np.meshgrid(xi, xj)
+
+        Xgrid = np.tile(Xref_3d.reshape(1, -1), (XI.size, 1))
+        Xgrid[:, i] = XI.reshape(-1)
+        Xgrid[:, j] = XJ.reshape(-1)
+
+        Z = predict_from_origX(Xgrid).reshape(XI.shape)
+
+        fig = plt.figure(figsize=(FIG_WIDTH, FIG_WIDTH * 0.85))
+        ax = fig.add_subplot(111, projection="3d")
+        surf = ax.plot_surface(XI, XJ, Z, cmap="viridis", linewidth=0, antialiased=True, alpha=0.95)
+        fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Predicted output")
+
+        ax.set_title(f"Predicted surface: {inputs_columns[i]} vs {inputs_columns[j]}\n(others held constant: {HOLD_MODE_EXPORT})")
+        ax.set_xlabel(str(inputs_columns[i]))
+        ax.set_ylabel(str(inputs_columns[j]))
+        ax.set_zlabel("Predicted output")
+        ax.view_init(elev=25, azim=-135)
+        plt.tight_layout()
+
+        out_tiff = os.path.join(
+            plots_dir_3d,
+            f"surface_{_safe_name(inputs_columns[i])}_vs_{_safe_name(inputs_columns[j])}_hold_{HOLD_MODE_EXPORT}.tiff"
+        )
+        plt.savefig(out_tiff, dpi=DPI, format='tiff')
+        plt.close(fig)
+
+    print(f"3D surfaces saved as TIFF ({DPI} dpi, {FIG_WIDTH}in width). Count: {len([f for f in os.listdir(plots_dir_3d) if f.lower().endswith('.tiff')])}")
+except Exception as e:
+    print("Error while generating 3D surfaces:", e)
+    traceback.print_exc()
+
+print("\n" + "="*70)
+print("PHASE 9 DONE - 3D surface plots generated and exported")
+print("="*70)
