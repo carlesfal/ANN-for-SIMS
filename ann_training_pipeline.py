@@ -42,9 +42,21 @@ import traceback
 import numpy as np
 import pandas as pd
 import joblib
+import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime as _dt
+
+# --- Global plot settings: Arial font, 8.3 cm width, 600 DPI ---
+matplotlib.rcParams['font.family'] = 'sans-serif'
+matplotlib.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
+matplotlib.rcParams['font.size'] = 8
+matplotlib.rcParams['axes.titlesize'] = 9
+matplotlib.rcParams['axes.labelsize'] = 8
+matplotlib.rcParams['xtick.labelsize'] = 7
+matplotlib.rcParams['ytick.labelsize'] = 7
+matplotlib.rcParams['figure.dpi'] = 600
+matplotlib.rcParams['savefig.dpi'] = 600
 
 import tensorflow as tf
 from tensorflow import keras
@@ -129,6 +141,10 @@ WARMSTART_LR         = 1e-4    # FIX #12: learning rate for warm-start phase
 # --- Prediction intervals ---
 PI_CALIBRATION = "val"   # "val" → calibrate on val residuals | "oof" → OOF residuals
 PI_ALPHA       = 0.05    # 95% PI (2.5% / 97.5% empirical quantiles)
+
+# --- Plot settings ---
+DPI       = 600
+FIG_WIDTH = 8.3 / 2.54   # 8.3 cm -> inches
 
 # --- Output ---
 EXPORT_DIR = "optimized_model"
@@ -1190,8 +1206,6 @@ RANGE_MODE_EXPORT = "quantile"
 Q_LOW_EXPORT, Q_HIGH_EXPORT = 0.02, 0.98
 HOLD_MODE_EXPORT = "median_train"
 ROW_INDEX_EXPORT = 0
-DPI = 600
-FIG_WIDTH = 8.3 / 2.54  # 8.3 cm -> inches
 # ------------------------------------------------
 
 if "inputs_columns" not in globals():
