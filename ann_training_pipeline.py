@@ -14,6 +14,10 @@
 #   #7    — scaler reassignment in retrain block is documented
 #   #9    — NEW: smart weight transfer function with partial matching
 #   #10   — NEW: best fold weights fed into final training
+#   #11   — NEW: optimized Hill pre-training (curriculum, cosine LR,
+#                 wider warmup, multi-feature Hill surface)
+#   #12   — NEW: scale-aware weight transfer preserving activation
+#                 variance + warm-start fine-tuning after transfer
 # ============================================================
 
 # --- Detect notebook / Colab ---
@@ -86,13 +90,15 @@ def _show(obj, n=5):
 
 # --- Hill pre-training ---
 N_INPUTS        = 10
-N_SYNTHETIC     = 500
+N_SYNTHETIC     = 2000         # FIX #11: more synthetic data for richer pre-training
 HILL_V_MAX      = 200
 HILL_K          = 0.10
 HILL_N          = 1.20
 HILL_X_MIN      = 0.1
 HILL_X_MAX      = 100
-PRETRAIN_EPOCHS = 200
+PRETRAIN_EPOCHS = 300          # FIX #11: longer budget (cosine LR + curriculum)
+HILL_CURRICULUM  = True         # FIX #11: staged noise curriculum
+HILL_MULTI_FEAT  = True         # FIX #11: multi-feature Hill interactions
 
 # --- Data split ---
 TRAIN_PERCENT = 60
@@ -116,6 +122,9 @@ DO_OPTIONAL_RETRAIN = True
 # --- Weight Transfer ---
 TRANSFER_MODE       = "smart"  # "smart" (partial/slice), "strict" (exact match only)
 TRANSFER_BEST_FOLD  = True     # seed final model from best CV fold weights
+TRANSFER_SCALE_AWARE = True    # FIX #12: scale weights by fan ratio on partial transfer
+WARMSTART_EPOCHS     = 10      # FIX #12: brief low-LR fine-tune after weight transfer
+WARMSTART_LR         = 1e-4    # FIX #12: learning rate for warm-start phase
 
 # --- Prediction intervals ---
 PI_CALIBRATION = "val"   # "val" → calibrate on val residuals | "oof" → OOF residuals
@@ -148,7 +157,29 @@ if DISABLE_GPU:
 # SMART WEIGHT TRANSFER UTILITIES (FIX #9)
 # =====================================================================
 
-def transfer_weights_smart(source_model, target_model, mode="smart", verbose=True):
+def _scale_kernel_slice(ws, wt, slice_kernel, scale_aware=True):
+    """
+    FIX #12: When transferring a partial kernel slice, scale the values
+    to preserve activation variance (He-style fan-in correction).
+
+    If source kernel is (in_s, out_s) and target is (in_t, out_t),
+    the transferred slice covers min(in_s,in_t) inputs. But the target
+    neuron expects in_t inputs. Scale by sqrt(min_in / in_t) so the
+    variance of the pre-activation stays roughly the same.
+    """
+    if not scale_aware or ws.ndim != 2 or wt.ndim != 2:
+        return slice_kernel
+    in_src, _ = ws.shape
+    in_tgt, _ = wt.shape
+    min_in = min(in_src, in_tgt)
+    if min_in == in_tgt:
+        return slice_kernel
+    scale = np.sqrt(float(min_in) / float(in_tgt))
+    return slice_kernel * scale
+
+
+def transfer_weights_smart(source_model, target_model, mode="smart",
+                           scale_aware=None, verbose=True):
     """
     Transfer weights from source_model to target_model layer-by-layer.
 
@@ -158,6 +189,8 @@ def transfer_weights_smart(source_model, target_model, mode="smart", verbose=Tru
                   For a Dense layer with kernel (in, out):
                     - transfer min(in_src, in_tgt) x min(out_src, out_tgt) slice
                     - transfer min(out_src, out_tgt) bias entries
+                  FIX #12: optionally scales partial kernels by fan-in ratio
+                  to preserve activation variance (He initialization).
 
     Returns:
       dict with keys:
@@ -166,6 +199,9 @@ def transfer_weights_smart(source_model, target_model, mode="smart", verbose=Tru
         "skipped" — count of layers skipped entirely
         "details" — list of per-layer info strings
     """
+    if scale_aware is None:
+        scale_aware = TRANSFER_SCALE_AWARE
+
     dense_src = [l for l in source_model.layers if isinstance(l, layers.Dense)]
     dense_tgt = [l for l in target_model.layers if isinstance(l, layers.Dense)]
 
@@ -177,47 +213,45 @@ def transfer_weights_smart(source_model, target_model, mode="smart", verbose=Tru
         wt_list = lt.get_weights()
 
         if len(ws_list) != len(wt_list):
-            info = f"  Layer {i} ({ls.name} → {lt.name}): skipped (different # weight arrays)"
+            info = f"  Layer {i} ({ls.name} -> {lt.name}): skipped (different # weight arrays)"
             stats["skipped"] += 1
             stats["details"].append(info)
             if verbose:
                 print(info)
             continue
 
-        # Check if all shapes match exactly
         all_match = all(ws.shape == wt.shape for ws, wt in zip(ws_list, wt_list))
 
         if all_match:
             lt.set_weights(ws_list)
-            info = (f"  Layer {i} ({ls.name} → {lt.name}): "
+            info = (f"  Layer {i} ({ls.name} -> {lt.name}): "
                     f"FULL transfer {[w.shape for w in ws_list]}")
             stats["full"] += 1
             stats["details"].append(info)
             if verbose:
                 print(info)
         elif mode == "smart":
-            # Attempt partial/slice transfer
             new_weights = []
             transferred_something = False
 
             for ws, wt in zip(ws_list, wt_list):
-                wt_current = lt.get_weights()[ws_list.index(ws)] if False else wt.copy()
-                # Get current target weights to preserve untouched regions
-                wt_current = np.array(wt)  # copy of current target weight
+                wt_current = np.array(wt)
 
                 if ws.ndim == 2 and wt.ndim == 2:
-                    # Kernel: (input_dim, output_dim)
                     min_in = min(ws.shape[0], wt.shape[0])
                     min_out = min(ws.shape[1], wt.shape[1])
                     if min_in > 0 and min_out > 0:
                         wt_new = wt_current.copy()
-                        wt_new[:min_in, :min_out] = ws[:min_in, :min_out]
+                        raw_slice = ws[:min_in, :min_out]
+                        scaled_slice = _scale_kernel_slice(
+                            ws, wt, raw_slice, scale_aware=scale_aware
+                        )
+                        wt_new[:min_in, :min_out] = scaled_slice
                         new_weights.append(wt_new)
                         transferred_something = True
                     else:
                         new_weights.append(wt_current)
                 elif ws.ndim == 1 and wt.ndim == 1:
-                    # Bias: (output_dim,)
                     min_dim = min(ws.shape[0], wt.shape[0])
                     if min_dim > 0:
                         wt_new = wt_current.copy()
@@ -227,38 +261,31 @@ def transfer_weights_smart(source_model, target_model, mode="smart", verbose=Tru
                     else:
                         new_weights.append(wt_current)
                 else:
-                    # Higher-dimensional or mismatched ndims — skip
                     new_weights.append(wt_current)
 
             if transferred_something:
-                # Re-read current target weights to get proper copies
-                current_tgt_weights = lt.get_weights()
-                for idx in range(len(new_weights)):
-                    if new_weights[idx] is None:
-                        new_weights[idx] = current_tgt_weights[idx]
                 lt.set_weights(new_weights)
                 src_shapes = [w.shape for w in ws_list]
                 tgt_shapes = [w.shape for w in wt_list]
-                info = (f"  Layer {i} ({ls.name} → {lt.name}): "
-                        f"PARTIAL transfer (src={src_shapes}, tgt={tgt_shapes})")
+                scale_tag = "+scaled" if scale_aware else ""
+                info = (f"  Layer {i} ({ls.name} -> {lt.name}): "
+                        f"PARTIAL{scale_tag} transfer (src={src_shapes}, tgt={tgt_shapes})")
                 stats["partial"] += 1
             else:
-                info = (f"  Layer {i} ({ls.name} → {lt.name}): "
+                info = (f"  Layer {i} ({ls.name} -> {lt.name}): "
                         f"skipped (no overlap)")
                 stats["skipped"] += 1
             stats["details"].append(info)
             if verbose:
                 print(info)
         else:
-            # strict mode — skip on mismatch
-            info = (f"  Layer {i} ({ls.name} → {lt.name}): "
+            info = (f"  Layer {i} ({ls.name} -> {lt.name}): "
                     f"skipped (shape mismatch, strict mode)")
             stats["skipped"] += 1
             stats["details"].append(info)
             if verbose:
                 print(info)
 
-    # Report on unpaired layers
     if len(dense_src) > n_pairs:
         info = f"  {len(dense_src) - n_pairs} extra source layer(s) not transferred"
         stats["details"].append(info)
@@ -273,13 +300,50 @@ def transfer_weights_smart(source_model, target_model, mode="smart", verbose=Tru
     return stats
 
 
-def transfer_weights_to_fold(source_model, fold_model, mode="smart", verbose=False):
+def transfer_weights_to_fold(source_model, fold_model, mode="smart",
+                             scale_aware=None, verbose=False):
     """
     Convenience wrapper for transferring weights into a CV fold model.
     Returns True if at least one layer was transferred (full or partial).
     """
-    stats = transfer_weights_smart(source_model, fold_model, mode=mode, verbose=verbose)
+    stats = transfer_weights_smart(source_model, fold_model, mode=mode,
+                                   scale_aware=scale_aware, verbose=verbose)
     return (stats["full"] + stats["partial"]) > 0
+
+
+def warmstart_finetune(model_to_tune, X_tr, y_tr, X_va, y_va,
+                       epochs=None, lr=None):
+    """
+    FIX #12: Brief low-LR fine-tuning phase after weight transfer.
+    Gently adapts transferred weights to the new data distribution
+    before full training begins.
+    """
+    if epochs is None:
+        epochs = WARMSTART_EPOCHS
+    if lr is None:
+        lr = WARMSTART_LR
+    if epochs <= 0:
+        return None
+
+    model_to_tune.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr),
+        loss='mse', metrics=['mae']
+    )
+    es_ws = callbacks.EarlyStopping(
+        monitor='val_loss', patience=5, restore_best_weights=True
+    )
+    hist = model_to_tune.fit(
+        X_tr, y_tr,
+        validation_data=(X_va, y_va),
+        epochs=epochs,
+        batch_size=32,
+        callbacks=[es_ws],
+        verbose=0,
+    )
+    ws_best = min(hist.history['val_loss'])
+    print(f"    Warm-start fine-tune: {len(hist.history['loss'])} epochs, "
+          f"best val_loss={ws_best:.6f}")
+    return hist
 
 
 # ============================================================
@@ -289,22 +353,64 @@ print("\n" + "="*70)
 print("PHASE 1: HILL PRE-TRAINING")
 print("="*70)
 
-def _generate_hill_data(n_samples, n_features, v_max, k, n_hill, x_min, x_max):
+def _generate_hill_data(n_samples, n_features, v_max, k, n_hill, x_min, x_max,
+                        noise_frac=0.05, multi_feature=False):
+    """
+    FIX #11: Enhanced Hill data generation.
+    - noise_frac controls the noise level (for curriculum learning)
+    - multi_feature=True adds pairwise interaction terms so the warmup
+      model learns richer feature representations (not just x1-dominated).
+    """
     X  = np.random.uniform(x_min, x_max, (n_samples, n_features)).astype(np.float32)
     x1 = X[:, 0]
     y  = v_max * (x1 ** n_hill) / (k ** n_hill + x1 ** n_hill)
-    y += np.random.normal(0, 0.05 * v_max, n_samples)
-    for i in range(1, min(n_features, 3)):
-        y += 0.05 * v_max * (X[:, i] - x_min) / (x_max - x_min)
+
+    if multi_feature and n_features >= 2:
+        for i in range(1, min(n_features, 5)):
+            xi_norm = (X[:, i] - x_min) / (x_max - x_min)
+            y += 0.08 * v_max * xi_norm
+        for i in range(min(n_features - 1, 3)):
+            xi = (X[:, i] - x_min) / (x_max - x_min)
+            xj = (X[:, i + 1] - x_min) / (x_max - x_min)
+            y += 0.03 * v_max * xi * xj
+    else:
+        for i in range(1, min(n_features, 3)):
+            y += 0.05 * v_max * (X[:, i] - x_min) / (x_max - x_min)
+
+    y += np.random.normal(0, noise_frac * v_max, n_samples)
     return X, y.reshape(-1, 1)
 
-print("[1/4] Generating synthetic Hill data...")
+
+class CosineAnnealingSchedule(callbacks.Callback):
+    """FIX #11: Cosine annealing LR schedule with warm restarts."""
+    def __init__(self, lr_max=1e-3, lr_min=1e-5, T_0=50, T_mult=2):
+        super().__init__()
+        self.lr_max = lr_max
+        self.lr_min = lr_min
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self._cycle_epoch = 0
+        self._current_T = T_0
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if self._cycle_epoch >= self._current_T:
+            self._cycle_epoch = 0
+            self._current_T = int(self._current_T * self.T_mult)
+        frac = self._cycle_epoch / max(self._current_T, 1)
+        lr = self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (1 + np.cos(np.pi * frac))
+        self.model.optimizer.learning_rate.assign(lr)
+        self._cycle_epoch += 1
+
+
+print("[1/5] Generating synthetic Hill data...")
 X_h, y_h = _generate_hill_data(
-    N_SYNTHETIC, N_INPUTS, HILL_V_MAX, HILL_K, HILL_N, HILL_X_MIN, HILL_X_MAX
+    N_SYNTHETIC, N_INPUTS, HILL_V_MAX, HILL_K, HILL_N, HILL_X_MIN, HILL_X_MAX,
+    noise_frac=0.05 if not HILL_CURRICULUM else 0.01,
+    multi_feature=HILL_MULTI_FEAT,
 )
 print(f"  X {X_h.shape} | y {y_h.shape} | y range [{y_h.min():.2f}, {y_h.max():.2f}]")
 
-print("\n[2/4] Scaling Hill data (fit on full synthetic set)...")
+print("\n[2/5] Scaling Hill data (fit on full synthetic set)...")
 scaler_Xh = StandardScaler().fit(X_h)
 scaler_yh = StandardScaler().fit(y_h)
 X_h_sc    = scaler_Xh.transform(X_h)
@@ -315,10 +421,13 @@ X_h_train, X_h_val, y_h_train, y_h_val = train_test_split(
 )
 print(f"  Hill train {X_h_train.shape} | Hill val {X_h_val.shape}")
 
-print("\n[3/4] Building warmup model (128 -> 64 -> 32 -> 1)...")
+# FIX #11: Wider warmup model (256->128->64->32->1) to maximize weight overlap
+print("\n[3/5] Building warmup model (256 -> 128 -> 64 -> 32 -> 1)...")
 tf.keras.backend.clear_session()
 warmup_model = keras.Sequential([
     layers.Input(shape=(N_INPUTS,)),
+    layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(1e-3)),
+    layers.Dropout(0.2),
     layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(1e-3)),
     layers.Dropout(0.2),
     layers.Dense(64,  activation='relu', kernel_regularizer=regularizers.l2(1e-3)),
@@ -330,21 +439,71 @@ warmup_model = keras.Sequential([
 warmup_model.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mse')
 print(f"  {warmup_model.count_params():,} parameters")
 
-print(f"\n[4/4] Pre-training ({PRETRAIN_EPOCHS} epochs, early-stop patience=10)...")
-es_warmup   = callbacks.EarlyStopping(
-    monitor='val_loss', patience=10, restore_best_weights=True
-)
-hist_warmup = warmup_model.fit(
-    X_h_train, y_h_train,
-    validation_data=(X_h_val, y_h_val),
-    epochs=PRETRAIN_EPOCHS,
-    batch_size=32,
-    callbacks=[es_warmup],
-    verbose=1,
-)
-print(f"\n  Pre-training done | "
-      f"train loss {hist_warmup.history['loss'][-1]:.6f} | "
-      f"val loss   {hist_warmup.history['val_loss'][-1]:.6f}")
+# FIX #11: Curriculum learning — train in stages with increasing noise
+if HILL_CURRICULUM:
+    print(f"\n[4/5] Curriculum pre-training ({PRETRAIN_EPOCHS} total epochs)...")
+    noise_stages = [0.01, 0.03, 0.05, 0.10]
+    stage_epochs = PRETRAIN_EPOCHS // len(noise_stages)
+
+    cosine_cb = CosineAnnealingSchedule(lr_max=1e-3, lr_min=1e-5, T_0=stage_epochs // 2)
+    es_warmup = callbacks.EarlyStopping(
+        monitor='val_loss', patience=15, restore_best_weights=True
+    )
+
+    for stage_i, nf in enumerate(noise_stages, start=1):
+        print(f"\n  Stage {stage_i}/{len(noise_stages)}: noise_frac={nf}")
+        X_stage, y_stage = _generate_hill_data(
+            N_SYNTHETIC, N_INPUTS, HILL_V_MAX, HILL_K, HILL_N,
+            HILL_X_MIN, HILL_X_MAX, noise_frac=nf, multi_feature=HILL_MULTI_FEAT,
+        )
+        X_stage_sc = scaler_Xh.transform(X_stage)
+        y_stage_sc = scaler_yh.transform(y_stage)
+
+        X_st_tr, X_st_va, y_st_tr, y_st_va = train_test_split(
+            X_stage_sc, y_stage_sc, test_size=0.2, random_state=RANDOM_SEED + stage_i
+        )
+
+        cosine_cb._cycle_epoch = 0
+        cosine_cb._current_T = cosine_cb.T_0
+
+        hist_stage = warmup_model.fit(
+            X_st_tr, y_st_tr,
+            validation_data=(X_st_va, y_st_va),
+            epochs=stage_epochs,
+            batch_size=32,
+            callbacks=[es_warmup, cosine_cb],
+            verbose=0,
+        )
+        print(f"    -> {len(hist_stage.history['loss'])} epochs, "
+              f"train_loss={hist_stage.history['loss'][-1]:.6f}, "
+              f"val_loss={hist_stage.history['val_loss'][-1]:.6f}")
+
+    print("\n  Curriculum pre-training complete")
+else:
+    print(f"\n[4/5] Pre-training ({PRETRAIN_EPOCHS} epochs, cosine LR + early-stop)...")
+    cosine_cb = CosineAnnealingSchedule(lr_max=1e-3, lr_min=1e-5, T_0=50)
+    es_warmup = callbacks.EarlyStopping(
+        monitor='val_loss', patience=15, restore_best_weights=True
+    )
+    hist_warmup = warmup_model.fit(
+        X_h_train, y_h_train,
+        validation_data=(X_h_val, y_h_val),
+        epochs=PRETRAIN_EPOCHS,
+        batch_size=32,
+        callbacks=[es_warmup, cosine_cb],
+        verbose=1,
+    )
+    print(f"\n  Pre-training done | "
+          f"train loss {hist_warmup.history['loss'][-1]:.6f} | "
+          f"val loss   {hist_warmup.history['val_loss'][-1]:.6f}")
+
+# [5/5] Validate warmup quality
+print("\n[5/5] Warmup model validation...")
+y_h_val_pred = scaler_yh.inverse_transform(warmup_model.predict(X_h_val, verbose=0))
+y_h_val_true = scaler_yh.inverse_transform(y_h_val)
+warmup_r2 = r2_score(y_h_val_true.reshape(-1), y_h_val_pred.reshape(-1))
+warmup_rmse = np.sqrt(mean_squared_error(y_h_val_true.reshape(-1), y_h_val_pred.reshape(-1)))
+print(f"  Warmup model on Hill val: R2={warmup_r2:.4f}, RMSE={warmup_rmse:.4f}")
 
 print("\n" + "="*70)
 print("PHASE 1 DONE - warmup_model ready")
@@ -532,24 +691,36 @@ _model_with_pretrain = None
 model_for_transfer   = None
 
 try:
-    print("[1/3] Building model from best HPs...")
+    print("[1/4] Building model from best HPs...")
     model_for_transfer = tuner.hypermodel.build(best_hp)
     print(f"  {model_for_transfer.count_params():,} parameters")
 
-    print(f"\n[2/3] Smart weight transfer (mode='{TRANSFER_MODE}')...")
-    # FIX #9: use the smart transfer function instead of manual zip
+    print(f"\n[2/4] Smart weight transfer (mode='{TRANSFER_MODE}', "
+          f"scale_aware={TRANSFER_SCALE_AWARE})...")
     stats = transfer_weights_smart(
         warmup_model, model_for_transfer,
         mode=TRANSFER_MODE, verbose=True
     )
 
-    print(f"\n[3/3] Transfer summary: "
+    print(f"\n[3/4] Transfer summary: "
           f"{stats['full']} full, {stats['partial']} partial, "
           f"{stats['skipped']} skipped")
 
     if (stats["full"] + stats["partial"]) > 0:
         _model_with_pretrain = model_for_transfer
-        print("-> _model_with_pretrain is ready")
+
+        # FIX #12: warm-start fine-tuning after weight transfer
+        if WARMSTART_EPOCHS > 0:
+            print(f"\n[4/4] Warm-start fine-tuning ({WARMSTART_EPOCHS} epochs, "
+                  f"lr={WARMSTART_LR})...")
+            warmstart_finetune(
+                _model_with_pretrain, X_train, y_train, X_val, y_val,
+                epochs=WARMSTART_EPOCHS, lr=WARMSTART_LR
+            )
+        else:
+            print("\n[4/4] Warm-start skipped (WARMSTART_EPOCHS=0)")
+
+        print("-> _model_with_pretrain is ready (with warm-start)")
     else:
         print("WARNING: No weights transferred (architecture mismatch)")
 
@@ -560,7 +731,7 @@ except Exception as e:
 
 print("\n" + "="*70)
 if _model_with_pretrain is not None:
-    print("PHASE 4 DONE - pre-trained weights loaded")
+    print("PHASE 4 DONE - pre-trained weights loaded + warm-started")
 else:
     print("PHASE 4: no weight transfer")
     if model_for_transfer is not None:
@@ -623,6 +794,10 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
         )
         if not transferred and fold == 1:
             print(f"  NOTE: Fold {fold} weight seeding skipped (no compatible layers)")
+        # FIX #12: warm-start fine-tune per fold after weight transfer
+        elif transferred and WARMSTART_EPOCHS > 0:
+            warmstart_finetune(model_fold, X_tr, y_tr, X_va, y_va,
+                               epochs=WARMSTART_EPOCHS, lr=WARMSTART_LR)
 
     es_fold = callbacks.EarlyStopping(
         monitor='val_loss', patience=10, restore_best_weights=True
@@ -689,24 +864,32 @@ tf.keras.backend.clear_session()
 model    = tuner.hypermodel.build(best_hp)
 
 # FIX #10: seed final model from best CV fold weights if available
+_final_transferred = False
 if TRANSFER_BEST_FOLD and best_fold_weights is not None:
     print("[Weight Transfer] Seeding final model from best CV fold weights...")
     try:
         model.set_weights(best_fold_weights)
         print("  Full weight transfer from best fold successful")
+        _final_transferred = True
     except ValueError:
-        # If direct assignment fails (shouldn't since same architecture), use smart transfer
         print("  Direct transfer failed, using smart per-layer transfer...")
-        # Build a temporary model with best fold weights to use as source
         temp_source = tuner.hypermodel.build(best_hp)
         temp_source.set_weights(best_fold_weights)
-        transfer_weights_smart(temp_source, model, mode=TRANSFER_MODE, verbose=True)
+        stats = transfer_weights_smart(temp_source, model, mode=TRANSFER_MODE, verbose=True)
+        _final_transferred = (stats["full"] + stats["partial"]) > 0
         del temp_source
 elif use_pretrain and _model_with_pretrain is not None:
     print("[Weight Transfer] Seeding final model from warmup pre-trained weights...")
-    transfer_weights_smart(_model_with_pretrain, model, mode=TRANSFER_MODE, verbose=True)
+    stats = transfer_weights_smart(_model_with_pretrain, model, mode=TRANSFER_MODE, verbose=True)
+    _final_transferred = (stats["full"] + stats["partial"]) > 0
 else:
     print("[Weight Transfer] No weight seeding for final model (random init)")
+
+# FIX #12: warm-start fine-tune the final model after weight transfer
+if _final_transferred and WARMSTART_EPOCHS > 0:
+    print(f"[Warm-start] Fine-tuning final model ({WARMSTART_EPOCHS} epochs, lr={WARMSTART_LR})...")
+    warmstart_finetune(model, X_train, y_train, X_val, y_val,
+                       epochs=WARMSTART_EPOCHS, lr=WARMSTART_LR)
 
 mc       = callbacks.ModelCheckpoint(
     checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1
