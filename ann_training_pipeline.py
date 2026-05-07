@@ -862,6 +862,33 @@ ss_tot  = np.sum((y_oof_true_inv - np.mean(y_oof_true_inv)) ** 2)
 pred_R2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
 print(f"\n  Predicted R2 (Q2/PRESS): {pred_R2:.4f}")
 
+# --- Build K-fold summary statistics DataFrame for export ---
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# Per-fold results
+df_kfold_per_fold = pd.DataFrame({
+    "Fold":  list(range(1, K_FOLDS + 1)),
+    "R2":    r2_scores,
+    "RMSE":  rmse_scores,
+    "MAE":   mae_scores,
+})
+
+# Summary row (mean +/- std)
+df_kfold_summary = pd.DataFrame([
+    {"Fold": "Mean",  "R2": np.mean(r2_scores), "RMSE": np.mean(rmse_scores), "MAE": np.mean(mae_scores)},
+    {"Fold": "Std",   "R2": np.std(r2_scores),  "RMSE": np.std(rmse_scores),  "MAE": np.std(mae_scores)},
+    {"Fold": "Min",   "R2": np.min(r2_scores),  "RMSE": np.min(rmse_scores),  "MAE": np.min(mae_scores)},
+    {"Fold": "Max",   "R2": np.max(r2_scores),  "RMSE": np.max(rmse_scores),  "MAE": np.max(mae_scores)},
+    {"Fold": "Best",  "R2": best_fold_r2,       "RMSE": np.nan,               "MAE": np.nan},
+    {"Fold": "Q2",    "R2": pred_R2,            "RMSE": np.nan,               "MAE": np.nan},
+])
+
+df_kfold_stats = pd.concat([df_kfold_per_fold, df_kfold_summary], ignore_index=True)
+
+kfold_stats_path = os.path.join(EXPORT_DIR, "kfold_summary.csv")
+df_kfold_stats.to_csv(kfold_stats_path, index=False)
+print(f"\n  K-fold summary saved to: {kfold_stats_path}")
+
 print("\n" + "="*70)
 print("PHASE 5 DONE")
 print("="*70)
@@ -1154,6 +1181,7 @@ for name, frame in [("results_train.csv", df_train_res),
 
 if use_colab:
     for fname in ["results_train.csv", "results_val.csv", "results_test.csv",
+                  "kfold_summary.csv",
                   "final_model.keras", "scaler_X.pkl", "scaler_y.pkl"]:
         fpath = os.path.join(EXPORT_DIR, fname)
         try:
