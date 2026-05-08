@@ -109,6 +109,7 @@ HILL_N          = 1.20
 HILL_X_MIN      = 0.1
 HILL_X_MAX      = 100
 PRETRAIN_EPOCHS = 300          # FIX #11: longer budget (cosine LR + curriculum)
+HILL_ES_PATIENCE = 15           # early-stopping patience for Hill pre-training
 HILL_CURRICULUM  = True         # FIX #11: staged noise curriculum
 HILL_MULTI_FEAT  = True         # FIX #11: multi-feature Hill interactions
 
@@ -463,7 +464,7 @@ if HILL_CURRICULUM:
 
     cosine_cb = CosineAnnealingSchedule(lr_max=1e-3, lr_min=1e-5, T_0=stage_epochs // 2)
     es_warmup = callbacks.EarlyStopping(
-        monitor='val_loss', patience=15, restore_best_weights=True
+        monitor='val_loss', patience=HILL_ES_PATIENCE, restore_best_weights=True
     )
 
     for stage_i, nf in enumerate(noise_stages, start=1):
@@ -499,7 +500,7 @@ else:
     print(f"\n[4/5] Pre-training ({PRETRAIN_EPOCHS} epochs, cosine LR + early-stop)...")
     cosine_cb = CosineAnnealingSchedule(lr_max=1e-3, lr_min=1e-5, T_0=50)
     es_warmup = callbacks.EarlyStopping(
-        monitor='val_loss', patience=15, restore_best_weights=True
+        monitor='val_loss', patience=HILL_ES_PATIENCE, restore_best_weights=True
     )
     hist_warmup = warmup_model.fit(
         X_h_train, y_h_train,
