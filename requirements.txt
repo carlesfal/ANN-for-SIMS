@@ -7,3 +7,5 @@ matplotlib>=3.5
 seaborn>=0.12
 openpyxl>=3.0
 joblib>=1.1
+customtkinter>=5.2
+tensorboard>=2.10
