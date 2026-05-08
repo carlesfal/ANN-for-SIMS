@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QMainWindow,
@@ -71,8 +71,7 @@ class MainWindow(QMainWindow):
 
         log_dock = QDockWidget("Application Log", self)
         log_dock.setWidget(self.log_panel)
-        dock_area = 8  # Qt.RightDockWidgetArea
-        dock(dock_area, log_dock)
+        dock(Qt.DockWidgetArea.RightDockWidgetArea, log_dock)
 
         status = QStatusBar()
         self.setStatusBar(status)
