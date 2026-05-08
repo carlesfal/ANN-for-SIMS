@@ -144,7 +144,7 @@ PI_ALPHA       = 0.05    # 95% PI (2.5% / 97.5% empirical quantiles)
 
 # --- Plot settings ---
 DPI       = 600
-FIG_WIDTH = 8.3 / 2.54   # 8.3 cm -> inches
+FIG_WIDTH = 15.0 / 2.54   # 15 cm -> inches
 
 # --- Output ---
 EXPORT_DIR = "optimized_model"
@@ -1430,6 +1430,8 @@ print("DOWNLOAD: Collecting all results and plots")
 print("="*70)
 
 # --- List all exported files ---
+import zipfile as _zipfile
+
 _all_export_files = []
 for _root, _dirs, _files in os.walk(EXPORT_DIR):
     for _f in _files:
@@ -1441,17 +1443,34 @@ for _fp in sorted(_all_export_files):
     _sz  = os.path.getsize(_fp)
     print(f"  {_rel:50s}  ({_sz:>10,} bytes)")
 
-# --- Colab auto-download ---
-if use_colab:
-    print("\nDownloading files to browser...")
+# --- Compile everything into a single ZIP ---
+_zip_name = f"{EXPORT_DIR}_results.zip"
+with _zipfile.ZipFile(_zip_name, 'w', _zipfile.ZIP_DEFLATED) as _zf:
     for _fp in sorted(_all_export_files):
-        try:
-            colab_files.download(_fp)
-            print(f"  Downloaded: {os.path.relpath(_fp, EXPORT_DIR)}")
-        except Exception as e:
-            print(f"  Download failed for {os.path.relpath(_fp, EXPORT_DIR)}: {e}")
+        _arcname = os.path.relpath(_fp, '.')  # preserve folder structure
+        _zf.write(_fp, _arcname)
+print(f"\nZIP archive created: {_zip_name} "
+      f"({os.path.getsize(_zip_name):,} bytes, {len(_all_export_files)} files)")
+
+# --- Auto-download ---
+if use_colab:
+    print("\nDownloading ZIP to browser...")
+    try:
+        colab_files.download(_zip_name)
+        print(f"  Downloaded: {_zip_name}")
+    except Exception as e:
+        print(f"  ZIP download failed: {e}")
+        # Fallback: download files individually
+        print("  Falling back to individual file downloads...")
+        for _fp in sorted(_all_export_files):
+            try:
+                colab_files.download(_fp)
+                print(f"    Downloaded: {os.path.relpath(_fp, EXPORT_DIR)}")
+            except Exception as _e2:
+                print(f"    Failed: {os.path.relpath(_fp, EXPORT_DIR)}: {_e2}")
 else:
     print(f"\nAll outputs are in: {os.path.abspath(EXPORT_DIR)}/")
+    print(f"ZIP download:       {os.path.abspath(_zip_name)}")
 
 print("\n" + "="*70)
 print("ALL PHASES COMPLETE")
