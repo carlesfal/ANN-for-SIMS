@@ -443,7 +443,13 @@ X_hill_train, X_hill_val, y_hill_train, y_hill_val = train_test_split(
 )
 
 # Fixed architecture for warmup (matches final model structure for weight transfer)
-def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, d5=0.05, lr=1e-3):
+def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, d5=0.05, lr=1e-3,
+                     use_cosine_lr=False):
+    """
+    Build the base 5-layer Dense model.
+    use_cosine_lr: Only set True for Hill pre-training. Must be False for tuner/training
+                   builds to avoid conflict with ReduceLROnPlateau callbacks.
+    """
     model = keras.Sequential([
         layers.Input(shape=(n_inputs,)),
         layers.Dense(512, activation='relu',
@@ -463,8 +469,8 @@ def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, 
         layers.Dropout(d5, name="drop_5"),
         layers.Dense(1, activation='linear', name="dense_out"),
     ])
-    # Cosine decay LR schedule for pre-training
-    if HILL_USE_COSINE_LR:
+    # Cosine decay LR schedule ONLY for Hill pre-training
+    if use_cosine_lr and HILL_USE_COSINE_LR:
         steps_per_epoch = max(1, int(np.ceil(len(X_hill_train) / BATCH_SIZE)))
         total_steps = steps_per_epoch * HILL_PRETRAIN_EPOCHS
         lr_schedule = keras.optimizers.schedules.CosineDecay(
@@ -482,7 +488,7 @@ def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, 
     return model
 
 tf.keras.backend.clear_session()
-warmup_model = build_base_model(n_real_inputs)
+warmup_model = build_base_model(n_real_inputs, use_cosine_lr=True)
 print(f"Warmup model params: {warmup_model.count_params():,}")
 print(f"  Cosine LR: {HILL_USE_COSINE_LR} (init={HILL_INITIAL_LR}, min={HILL_MIN_LR})")
 
