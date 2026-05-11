@@ -18,7 +18,8 @@
 # ACTIVATION CHANGES (2026-05-11):
 # - Hidden layers: ReLU -> LeakyReLU (alpha=0.1)
 # - Output layer: linear -> sigmoid
-# - Fixed build_model_fixed -> build_model reference
+# - Fixed architecture to match pretrained Hill model (128->64->32->1)
+# - Name-based weight transfer for compatibility with warmup_model
 #
 # INCLUDES TWO DOWNLOAD SECTIONS:
 # 1. After model training - downloads train/val/test results
@@ -248,38 +249,41 @@ y_train = scaler_y.transform(y_train_orig)
 y_val   = scaler_y.transform(y_val_orig)
 y_test  = scaler_y.transform(y_test_orig)
 
-# --- Model builder for Keras-Tuner ---
+# --- Fixed-architecture model builder (matches pretrained Hill model) ---
+# Architecture: 128 -> 64 -> 32 -> 1 (same layer names as warmup_model)
 # Hidden layers: LeakyReLU | Output layer: Sigmoid
-def build_model(hp):
-    model = keras.Sequential()
-    model.add(layers.Input(shape=(X_train.shape[1],)))
-    n_layers = hp.Int('num_layers', 2, 6, step=1)
-
-    l2_val = hp.Choice('l2_reg', [1e-4, 1e-3, 1e-2])
-
-    for i in range(n_layers):
-        units = hp.Int(f'units_{i}', 64, 512, step=64)
-        model.add(layers.Dense(
-            units,
-            activation=None,  # activation applied separately via LeakyReLU
-            kernel_regularizer=regularizers.l2(l2_val)
-        ))
-        model.add(layers.LeakyReLU(negative_slope=LEAKY_ALPHA))
-        model.add(layers.Dropout(hp.Float(f'dropout_{i}', 0.0, 0.5, step=0.1)))
-
-    model.add(layers.Dense(1, activation=OUTPUT_ACTIVATION))
+def build_base_model(l2_val=1e-3, d1=0.2, d2=0.2, d3=0.1, lr=1e-3):
+    model = keras.Sequential([
+        layers.Input(shape=(X_train.shape[1],)),
+        layers.Dense(128, activation=None, kernel_regularizer=regularizers.l2(l2_val), name="dense_128"),
+        layers.LeakyReLU(negative_slope=LEAKY_ALPHA),
+        layers.Dropout(d1, name="drop_1"),
+        layers.Dense(64, activation=None, kernel_regularizer=regularizers.l2(l2_val), name="dense_64"),
+        layers.LeakyReLU(negative_slope=LEAKY_ALPHA),
+        layers.Dropout(d2, name="drop_2"),
+        layers.Dense(32, activation=None, kernel_regularizer=regularizers.l2(l2_val), name="dense_32"),
+        layers.LeakyReLU(negative_slope=LEAKY_ALPHA),
+        layers.Dropout(d3, name="drop_3"),
+        layers.Dense(1, activation=OUTPUT_ACTIVATION, name="dense_out"),
+    ])
     model.compile(
-        optimizer=keras.optimizers.Adam(
-            learning_rate=hp.Choice('lr', [1e-4, 5e-4, 1e-3, 5e-3])
-        ),
+        optimizer=keras.optimizers.Adam(learning_rate=lr),
         loss='mse',
         metrics=['mae']
     )
     return model
 
+def build_model_fixed(hp):
+    l2_val = hp.Choice('l2_reg', [1e-4, 1e-3, 1e-2])
+    d1     = hp.Float('dropout_1', 0.0, 0.3, step=0.05)
+    d2     = hp.Float('dropout_2', 0.0, 0.3, step=0.05)
+    d3     = hp.Float('dropout_3', 0.0, 0.2, step=0.05)
+    lr     = hp.Choice('lr', [1e-4, 5e-4, 1e-3, 5e-3])
+    return build_base_model(l2_val=l2_val, d1=d1, d2=d2, d3=d3, lr=lr)
+
 # --- Keras-Tuner search (RandomSearch) ---
 tuner = kt.RandomSearch(
-    build_model,
+    build_model_fixed,
     objective='val_loss',
     max_trials=TUNER_TRIALS,
     executions_per_trial=1,
@@ -295,7 +299,7 @@ print("Best hyperparameters found:")
 for k, v in best_hp.values.items():
     print(f"  {k}: {v}")
 
-# ---- Weight transfer from warmup_model (if available) ----
+# ---- Weight transfer from warmup_model (name-based Dense matching) ----
 print("\n" + "="*70)
 print("WEIGHT TRANSFER: Checking for pre-trained Hill model...")
 print("="*70)
@@ -305,33 +309,37 @@ _model_with_pretrain = None
 if 'warmup_model' in globals():
     print("✓ Found pre-trained warmup_model!")
     try:
-        model_for_transfer = tuner.hypermodel.build(best_hp)
+        model_for_transfer = build_model_fixed(best_hp)
+
+        warmup_dense = {l.name: l for l in warmup_model.layers if isinstance(l, layers.Dense)}
+        target_dense = {l.name: l for l in model_for_transfer.layers if isinstance(l, layers.Dense)}
 
         n_transferred = 0
-        for layer_final, layer_warmup in zip(model_for_transfer.layers, warmup_model.layers):
-            if isinstance(layer_final, layers.InputLayer) or isinstance(layer_warmup, layers.InputLayer):
+        for name, t_layer in target_dense.items():
+            if name not in warmup_dense:
+                print(f"  - Skip {name}: not found in warmup")
                 continue
+            w_layer = warmup_dense[name]
+            w_w = w_layer.get_weights()
+            t_w = t_layer.get_weights()
 
-            if not layer_final.weights or not layer_warmup.weights:
-                continue
-
-            try:
-                if layer_final.name.split('_')[0] == layer_warmup.name.split('_')[0]:
-                    layer_final.set_weights(layer_warmup.get_weights())
-                    n_transferred += 1
-                    print(f"  ✓ {layer_warmup.name} → {layer_final.name}")
-            except Exception as e:
-                print(f"  ⚠️ Skipping {layer_warmup.name}: {e}")
+            same = (len(w_w) == len(t_w)) and all(a.shape == b.shape for a, b in zip(w_w, t_w))
+            if same:
+                t_layer.set_weights(w_w)
+                n_transferred += 1
+                print(f"  ✓ Transferred {name}")
+            else:
+                print(f"  ✗ Shape mismatch {name}")
 
         if n_transferred > 0:
-            print(f"✓ Transferred {n_transferred} layers!")
+            print(f"✓ Transferred Dense layers: {n_transferred}")
             _model_with_pretrain = model_for_transfer
         else:
-            print("⚠️ No compatible weights (architecture mismatch)")
+            print("⚠️ No layers transferred; continuing with tuned initialization.")
     except Exception as e:
         print(f"✗ Weight transfer failed: {e}")
 else:
-    print("ℹ️  No pre-trained model found")
+    print("ℹ️  No pre-trained model found (run the Hill pre-training cell first)")
 
 print("="*70 + "\n")
 
@@ -369,7 +377,7 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
     y_tr = fold_scaler_y.transform(y_tr_orig)
     y_va = fold_scaler_y.transform(y_va_orig)
 
-    model_fold = build_model(best_hp)
+    model_fold = build_model_fixed(best_hp)
 
     if use_pretrain:
         model_fold.set_weights(base_model.get_weights())
@@ -426,7 +434,7 @@ mc = callbacks.ModelCheckpoint(checkpoint_path, monitor='val_loss', save_best_on
 es_final = callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
 
 tf.keras.backend.clear_session()
-model = tuner.hypermodel.build(best_hp)
+model = build_model_fixed(best_hp)
 history = model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
@@ -469,7 +477,7 @@ if DO_OPTIONAL_RETRAIN:
     y_test_tv = scaler_y_tv.transform(y_test_orig)
 
     tf.keras.backend.clear_session()
-    model_retrain = tuner.hypermodel.build(best_hp)
+    model_retrain = build_model_fixed(best_hp)
     model_retrain.fit(
         X_trainval_tv, y_trainval_tv,
         epochs=best_epoch,
