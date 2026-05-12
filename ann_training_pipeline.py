@@ -644,6 +644,126 @@ if TRANSFER_VALIDATE and n_transferred > 0:
 
 
 # =====================================================================
+# PHASE 5b: FINE-TUNING HELPERS (defined here so they're available for CV, ensemble, retrain)
+# =====================================================================
+
+class WarmupSchedule(keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup followed by constant LR."""
+    def __init__(self, target_lr, warmup_steps):
+        super().__init__()
+        self.target_lr = target_lr
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(self.warmup_steps, tf.float32)
+        return tf.cond(
+            step < warmup,
+            lambda: self.target_lr * (step / tf.maximum(warmup, 1.0)),
+            lambda: self.target_lr
+        )
+
+    def get_config(self):
+        return {"target_lr": self.target_lr, "warmup_steps": self.warmup_steps}
+
+def make_ft_optimizer(lr, use_warmup=True):
+    if use_warmup and LR_WARMUP_STEPS > 0:
+        lr_schedule = WarmupSchedule(lr, LR_WARMUP_STEPS)
+    else:
+        lr_schedule = lr
+    return keras.optimizers.AdamW(
+        learning_rate=lr_schedule,
+        weight_decay=WEIGHT_DECAY,
+        clipnorm=CLIPNORM,
+        use_ema=USE_EMA,
+        ema_momentum=EMA_MOMENTUM
+    )
+
+def make_ft_loss():
+    return keras.losses.Huber(delta=HUBER_DELTA) if USE_HUBER_LOSS else "mse"
+
+def compile_for_ft(model, lr, use_warmup=True):
+    model.compile(
+        optimizer=make_ft_optimizer(lr, use_warmup=use_warmup),
+        loss=make_ft_loss(),
+        metrics=[
+            keras.metrics.MeanAbsoluteError(name="mae"),
+            keras.metrics.RootMeanSquaredError(name="rmse")
+        ]
+    )
+
+def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
+    """
+    Improved 5-stage gradual unfreezing fine-tuning:
+      S1: output head only (dense_out)
+      S2: dense_32 + head
+      S3: dense_64 + dense_32 + head
+      S4: dense_128 + dense_64 + dense_32 + head
+      S5: full unfreeze (all layers, discriminative LR effect through lower base LR)
+
+    Each stage uses linear LR warmup at the start.
+    """
+    dense_layers = [l for l in model.layers if isinstance(l, layers.Dense)]
+
+    def _stage_callbacks(stage):
+        return [
+            callbacks.EarlyStopping(monitor="val_loss", patience=8,
+                                    restore_best_weights=True, verbose=0),
+            callbacks.TerminateOnNaN()
+        ]
+
+    # S1: output head only (dense_out)
+    for l in model.layers:
+        l.trainable = False
+    dense_layers[-1].trainable = True  # dense_out
+    compile_for_ft(model, LR_S1)
+    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+              epochs=EPOCHS_S1, batch_size=BATCH_SIZE,
+              callbacks=_stage_callbacks("s1"), verbose=0)
+
+    # S2: dense_32 + head
+    for l in model.layers:
+        l.trainable = False
+    if len(dense_layers) >= 2:
+        dense_layers[-2].trainable = True  # dense_32
+    dense_layers[-1].trainable = True      # dense_out
+    compile_for_ft(model, LR_S2)
+    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+              epochs=EPOCHS_S2, batch_size=BATCH_SIZE,
+              callbacks=_stage_callbacks("s2"), verbose=0)
+
+    # S3: dense_64 + dense_32 + head
+    for l in model.layers:
+        l.trainable = False
+    for dl in dense_layers[-3:]:  # dense_64, dense_32, dense_out
+        dl.trainable = True
+    compile_for_ft(model, LR_S3)
+    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+              epochs=EPOCHS_S3, batch_size=BATCH_SIZE,
+              callbacks=_stage_callbacks("s3"), verbose=0)
+
+    # S4: dense_128 + dense_64 + dense_32 + head
+    for l in model.layers:
+        l.trainable = False
+    for dl in dense_layers[-4:]:  # dense_128, dense_64, dense_32, dense_out
+        dl.trainable = True
+    compile_for_ft(model, LR_S4)
+    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+              epochs=EPOCHS_S4, batch_size=BATCH_SIZE,
+              callbacks=_stage_callbacks("s4"), verbose=0)
+
+    # S5: full unfreeze with lower base LR (discriminative effect)
+    for l in model.layers:
+        l.trainable = True
+    compile_for_ft(model, LR_S5)
+    h = model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+                  epochs=EPOCHS_S5, batch_size=BATCH_SIZE,
+                  callbacks=_stage_callbacks("s5"), verbose=0)
+
+    return model, h
+
+
+# =====================================================================
 # PHASE 6: K-FOLD CV ON TRAIN (no leakage, ensemble per fold)
 # =====================================================================
 print("\n" + "=" * 70)
@@ -751,136 +871,6 @@ print("PHASE 7: ENSEMBLE TRAINING")
 print("=" * 70)
 
 os.makedirs(EXPORT_DIR, exist_ok=True)
-
-# --- Fine-tuning helpers (improved: 5-stage gradual unfreezing + discriminative LR) ---
-
-class WarmupSchedule(keras.optimizers.schedules.LearningRateSchedule):
-    """Linear warmup followed by constant LR."""
-    def __init__(self, target_lr, warmup_steps):
-        super().__init__()
-        self.target_lr = target_lr
-        self.warmup_steps = warmup_steps
-
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        warmup = tf.cast(self.warmup_steps, tf.float32)
-        return tf.cond(
-            step < warmup,
-            lambda: self.target_lr * (step / tf.maximum(warmup, 1.0)),
-            lambda: self.target_lr
-        )
-
-    def get_config(self):
-        return {"target_lr": self.target_lr, "warmup_steps": self.warmup_steps}
-
-def make_ft_optimizer(lr, use_warmup=True):
-    if use_warmup and LR_WARMUP_STEPS > 0:
-        lr_schedule = WarmupSchedule(lr, LR_WARMUP_STEPS)
-    else:
-        lr_schedule = lr
-    return keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=WEIGHT_DECAY,
-        clipnorm=CLIPNORM,
-        use_ema=USE_EMA,
-        ema_momentum=EMA_MOMENTUM
-    )
-
-def make_ft_loss():
-    return keras.losses.Huber(delta=HUBER_DELTA) if USE_HUBER_LOSS else "mse"
-
-def compile_for_ft(model, lr, use_warmup=True):
-    model.compile(
-        optimizer=make_ft_optimizer(lr, use_warmup=use_warmup),
-        loss=make_ft_loss(),
-        metrics=[
-            keras.metrics.MeanAbsoluteError(name="mae"),
-            keras.metrics.RootMeanSquaredError(name="rmse")
-        ]
-    )
-
-def compile_discriminative_lr(model, base_lr):
-    """
-    Apply discriminative learning rates: lower (earlier) layers get smaller LR.
-    Uses per-variable LR scaling via a custom training step is complex, so
-    instead we use layer-wise trainability + multiple stages to approximate
-    the effect. For the full-unfreeze stage, we set all trainable and use
-    the base_lr (the layer-by-layer effect is achieved through the staged approach).
-    """
-    compile_for_ft(model, base_lr, use_warmup=True)
-
-def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
-    """
-    Improved 5-stage gradual unfreezing fine-tuning:
-      S1: output head only (dense_out)
-      S2: dense_32 + head
-      S3: dense_64 + dense_32 + head
-      S4: dense_128 + dense_64 + dense_32 + head
-      S5: full unfreeze (all layers, discriminative LR effect through lower base LR)
-
-    Each stage uses linear LR warmup at the start.
-    """
-    dense_layers = [l for l in model.layers if isinstance(l, layers.Dense)]
-    # dense_layers order: [dense_512, dense_256, dense_128, dense_64, dense_32, dense_out]
-
-    def _stage_callbacks(stage):
-        return [
-            callbacks.EarlyStopping(monitor="val_loss", patience=8,
-                                    restore_best_weights=True, verbose=0),
-            callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                        patience=3, min_lr=1e-7, verbose=0),
-            callbacks.TerminateOnNaN()
-        ]
-
-    # S1: output head only (dense_out)
-    for l in model.layers:
-        l.trainable = False
-    dense_layers[-1].trainable = True  # dense_out
-    compile_for_ft(model, LR_S1)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S1, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s1"), verbose=0)
-
-    # S2: dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    if len(dense_layers) >= 2:
-        dense_layers[-2].trainable = True  # dense_32
-    dense_layers[-1].trainable = True      # dense_out
-    compile_for_ft(model, LR_S2)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S2, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s2"), verbose=0)
-
-    # S3: dense_64 + dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    for dl in dense_layers[-3:]:  # dense_64, dense_32, dense_out
-        dl.trainable = True
-    compile_for_ft(model, LR_S3)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S3, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s3"), verbose=0)
-
-    # S4: dense_128 + dense_64 + dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    for dl in dense_layers[-4:]:  # dense_128, dense_64, dense_32, dense_out
-        dl.trainable = True
-    compile_for_ft(model, LR_S4)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S4, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s4"), verbose=0)
-
-    # S5: full unfreeze with lower base LR (discriminative effect)
-    for l in model.layers:
-        l.trainable = True
-    compile_for_ft(model, LR_S5)
-    h = model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-                  epochs=EPOCHS_S5, batch_size=BATCH_SIZE,
-                  callbacks=_stage_callbacks("s5"), verbose=0)
-
-    return model, h
 
 # --- Train ensemble ---
 ensemble_models = []
