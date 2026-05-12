@@ -206,6 +206,10 @@ USE_EMA       = True
 EMA_MOMENTUM  = 0.99
 WEIGHT_DECAY  = 1e-5
 
+# --- Cosine decay LR schedule (applied across all training phases) ---
+USE_COSINE_DECAY = True           # Cosine decay LR everywhere for smoother convergence
+COSINE_DECAY_ALPHA = 0.01         # Min LR ratio at end of cosine (min_lr = initial_lr * 0.01)
+
 # --- Transfer learning advanced config ---
 TRANSFER_BLEND_ALPHA = 0.85   # Blend factor: new_weights = alpha*pretrained + (1-alpha)*random_init
 TRANSFER_VALIDATE = True      # Measure loss before/after transfer to confirm benefit
@@ -362,6 +366,39 @@ print("Scaling complete (train-fit only)")
 
 
 # =====================================================================
+# LR SCHEDULE UTILITIES (needed before Phase 3+)
+# =====================================================================
+
+class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup followed by cosine decay to min_lr = initial_lr * alpha."""
+    def __init__(self, initial_lr, total_steps, warmup_steps=0, alpha=0.01):
+        super().__init__()
+        self.initial_lr = float(initial_lr)
+        self.total_steps = int(total_steps)
+        self.warmup_steps = int(warmup_steps)
+        self.alpha = float(alpha)
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(self.warmup_steps, tf.float32)
+        total = tf.cast(self.total_steps, tf.float32)
+        warmup_lr = self.initial_lr * (step / tf.maximum(warmup, 1.0))
+        decay_steps = tf.maximum(total - warmup, 1.0)
+        cosine_step = tf.minimum(tf.maximum(step - warmup, 0.0), decay_steps)
+        cosine_frac = 0.5 * (1.0 + tf.cos(np.pi * cosine_step / decay_steps))
+        cosine_lr = self.initial_lr * (self.alpha + (1.0 - self.alpha) * cosine_frac)
+        return tf.cond(step < warmup, lambda: warmup_lr, lambda: cosine_lr)
+
+    def get_config(self):
+        return {"initial_lr": self.initial_lr, "total_steps": self.total_steps,
+                "warmup_steps": self.warmup_steps, "alpha": self.alpha}
+
+def _compute_total_steps(n_samples, epochs):
+    """Compute total training steps for cosine decay schedule."""
+    return max(1, int(np.ceil(n_samples / BATCH_SIZE))) * epochs
+
+
+# =====================================================================
 # PHASE 3: HILL PRE-TRAINING WARMUP
 # =====================================================================
 print("\n" + "=" * 70)
@@ -444,11 +481,11 @@ X_hill_train, X_hill_val, y_hill_train, y_hill_val = train_test_split(
 
 # Fixed architecture for warmup (matches final model structure for weight transfer)
 def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, d5=0.05, lr=1e-3,
-                     use_cosine_lr=False):
+                     use_cosine_lr=False, total_steps_hint=None):
     """
     Build the base 5-layer Dense model.
-    use_cosine_lr: Only set True for Hill pre-training. Must be False for tuner/training
-                   builds to avoid conflict with ReduceLROnPlateau callbacks.
+    use_cosine_lr: True for Hill pre-training with Hill-specific cosine config.
+    total_steps_hint: If provided and USE_COSINE_DECAY is True, applies cosine decay.
     """
     model = keras.Sequential([
         layers.Input(shape=(n_inputs,)),
@@ -469,14 +506,22 @@ def build_base_model(n_inputs, l2_val=1e-3, d1=0.25, d2=0.20, d3=0.15, d4=0.10, 
         layers.Dropout(d5, name="drop_5"),
         layers.Dense(1, activation='linear', name="dense_out"),
     ])
-    # Cosine decay LR schedule ONLY for Hill pre-training
+    # LR schedule selection
     if use_cosine_lr and HILL_USE_COSINE_LR:
+        # Hill pre-training: CosineDecay with Hill-specific min LR
         steps_per_epoch = max(1, int(np.ceil(len(X_hill_train) / BATCH_SIZE)))
         total_steps = steps_per_epoch * HILL_PRETRAIN_EPOCHS
-        lr_schedule = keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=HILL_INITIAL_LR,
-            decay_steps=total_steps,
+        lr_schedule = WarmupCosineDecay(
+            HILL_INITIAL_LR, total_steps,
+            warmup_steps=LR_WARMUP_STEPS,
             alpha=HILL_MIN_LR / HILL_INITIAL_LR
+        )
+    elif USE_COSINE_DECAY and total_steps_hint is not None:
+        # Cosine decay for tuner / general builds
+        lr_schedule = WarmupCosineDecay(
+            lr, total_steps_hint,
+            warmup_steps=LR_WARMUP_STEPS,
+            alpha=COSINE_DECAY_ALPHA
         )
     else:
         lr_schedule = lr
@@ -530,8 +575,10 @@ def build_model_tunable(hp):
     d4     = hp.Float('dropout_4', 0.00, 0.25, step=0.05)
     d5     = hp.Float('dropout_5', 0.00, 0.20, step=0.05)
     lr     = hp.Float('lr', 1e-5, 3e-3, sampling='log')
+    tuner_total_steps = _compute_total_steps(len(X_train), TUNER_EPOCHS)
     return build_base_model(n_real_inputs, l2_val=l2_val,
-                            d1=d1, d2=d2, d3=d3, d4=d4, d5=d5, lr=lr)
+                            d1=d1, d2=d2, d3=d3, d4=d4, d5=d5, lr=lr,
+                            total_steps_hint=tuner_total_steps)
 
 tuner = kt.RandomSearch(
     build_model_tunable,
@@ -546,10 +593,9 @@ tuner = kt.RandomSearch(
 tuner_callbacks = [
     callbacks.EarlyStopping(monitor='val_loss', patience=8,
                             restore_best_weights=True, verbose=1),
-    callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4,
-                                min_lr=1e-6, verbose=1),
     callbacks.TerminateOnNaN()
 ]
+# Note: ReduceLROnPlateau removed — cosine decay handles LR scheduling
 
 print(f"Starting tuner search ({TUNER_TRIALS} trials)...")
 tuner.search(
@@ -647,28 +693,11 @@ if TRANSFER_VALIDATE and n_transferred > 0:
 # PHASE 5b: FINE-TUNING HELPERS (defined here so they're available for CV, ensemble, retrain)
 # =====================================================================
 
-class WarmupSchedule(keras.optimizers.schedules.LearningRateSchedule):
-    """Linear warmup followed by constant LR."""
-    def __init__(self, target_lr, warmup_steps):
-        super().__init__()
-        self.target_lr = target_lr
-        self.warmup_steps = warmup_steps
-
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        warmup = tf.cast(self.warmup_steps, tf.float32)
-        return tf.cond(
-            step < warmup,
-            lambda: self.target_lr * (step / tf.maximum(warmup, 1.0)),
-            lambda: self.target_lr
-        )
-
-    def get_config(self):
-        return {"target_lr": self.target_lr, "warmup_steps": self.warmup_steps}
-
-def make_ft_optimizer(lr, use_warmup=True):
-    if use_warmup and LR_WARMUP_STEPS > 0:
-        lr_schedule = WarmupSchedule(lr, LR_WARMUP_STEPS)
+def make_ft_optimizer(lr, total_steps=None, warmup_steps=0):
+    if USE_COSINE_DECAY and total_steps is not None and total_steps > 0:
+        lr_schedule = WarmupCosineDecay(lr, total_steps, warmup_steps, COSINE_DECAY_ALPHA)
+    elif warmup_steps > 0:
+        lr_schedule = WarmupCosineDecay(lr, total_steps or 10000, warmup_steps, 1.0)
     else:
         lr_schedule = lr
     return keras.optimizers.AdamW(
@@ -682,9 +711,25 @@ def make_ft_optimizer(lr, use_warmup=True):
 def make_ft_loss():
     return keras.losses.Huber(delta=HUBER_DELTA) if USE_HUBER_LOSS else "mse"
 
-def compile_for_ft(model, lr, use_warmup=True):
+def compile_for_ft(model, lr, total_steps=None, warmup_steps=0):
     model.compile(
-        optimizer=make_ft_optimizer(lr, use_warmup=use_warmup),
+        optimizer=make_ft_optimizer(lr, total_steps, warmup_steps),
+        loss=make_ft_loss(),
+        metrics=[
+            keras.metrics.MeanAbsoluteError(name="mae"),
+            keras.metrics.RootMeanSquaredError(name="rmse")
+        ]
+    )
+
+def compile_with_cosine(model, lr, n_samples, epochs):
+    """Compile model with cosine decay LR for non-staged training paths."""
+    total_steps = _compute_total_steps(n_samples, epochs)
+    if USE_COSINE_DECAY:
+        lr_schedule = WarmupCosineDecay(lr, total_steps, LR_WARMUP_STEPS, COSINE_DECAY_ALPHA)
+    else:
+        lr_schedule = lr
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
         loss=make_ft_loss(),
         metrics=[
             keras.metrics.MeanAbsoluteError(name="mae"),
@@ -694,18 +739,17 @@ def compile_for_ft(model, lr, use_warmup=True):
 
 def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
     """
-    Improved 5-stage gradual unfreezing fine-tuning:
+    5-stage gradual unfreezing with warmup + cosine decay per stage:
       S1: output head only (dense_out)
       S2: dense_32 + head
       S3: dense_64 + dense_32 + head
       S4: dense_128 + dense_64 + dense_32 + head
-      S5: full unfreeze (all layers, discriminative LR effect through lower base LR)
-
-    Each stage uses linear LR warmup at the start.
+      S5: full unfreeze (lower base LR for discriminative effect)
     """
     dense_layers = [l for l in model.layers if isinstance(l, layers.Dense)]
+    n_train = len(X_tr)
 
-    def _stage_callbacks(stage):
+    def _stage_callbacks():
         return [
             callbacks.EarlyStopping(monitor="val_loss", patience=8,
                                     restore_best_weights=True, verbose=0),
@@ -715,50 +759,50 @@ def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
     # S1: output head only (dense_out)
     for l in model.layers:
         l.trainable = False
-    dense_layers[-1].trainable = True  # dense_out
-    compile_for_ft(model, LR_S1)
+    dense_layers[-1].trainable = True
+    compile_for_ft(model, LR_S1, _compute_total_steps(n_train, EPOCHS_S1), LR_WARMUP_STEPS)
     model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
               epochs=EPOCHS_S1, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s1"), verbose=0)
+              callbacks=_stage_callbacks(), verbose=0)
 
     # S2: dense_32 + head
     for l in model.layers:
         l.trainable = False
     if len(dense_layers) >= 2:
-        dense_layers[-2].trainable = True  # dense_32
-    dense_layers[-1].trainable = True      # dense_out
-    compile_for_ft(model, LR_S2)
+        dense_layers[-2].trainable = True
+    dense_layers[-1].trainable = True
+    compile_for_ft(model, LR_S2, _compute_total_steps(n_train, EPOCHS_S2), LR_WARMUP_STEPS)
     model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
               epochs=EPOCHS_S2, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s2"), verbose=0)
+              callbacks=_stage_callbacks(), verbose=0)
 
     # S3: dense_64 + dense_32 + head
     for l in model.layers:
         l.trainable = False
-    for dl in dense_layers[-3:]:  # dense_64, dense_32, dense_out
+    for dl in dense_layers[-3:]:
         dl.trainable = True
-    compile_for_ft(model, LR_S3)
+    compile_for_ft(model, LR_S3, _compute_total_steps(n_train, EPOCHS_S3), LR_WARMUP_STEPS)
     model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
               epochs=EPOCHS_S3, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s3"), verbose=0)
+              callbacks=_stage_callbacks(), verbose=0)
 
     # S4: dense_128 + dense_64 + dense_32 + head
     for l in model.layers:
         l.trainable = False
-    for dl in dense_layers[-4:]:  # dense_128, dense_64, dense_32, dense_out
+    for dl in dense_layers[-4:]:
         dl.trainable = True
-    compile_for_ft(model, LR_S4)
+    compile_for_ft(model, LR_S4, _compute_total_steps(n_train, EPOCHS_S4), LR_WARMUP_STEPS)
     model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
               epochs=EPOCHS_S4, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks("s4"), verbose=0)
+              callbacks=_stage_callbacks(), verbose=0)
 
     # S5: full unfreeze with lower base LR (discriminative effect)
     for l in model.layers:
         l.trainable = True
-    compile_for_ft(model, LR_S5)
+    compile_for_ft(model, LR_S5, _compute_total_steps(n_train, EPOCHS_S5), LR_WARMUP_STEPS)
     h = model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
                   epochs=EPOCHS_S5, batch_size=BATCH_SIZE,
-                  callbacks=_stage_callbacks("s5"), verbose=0)
+                  callbacks=_stage_callbacks(), verbose=0)
 
     return model, h
 
@@ -816,6 +860,8 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
                 model_fold, X_tr_m, y_tr_m, X_va, y_va, f"cv_f{fold}_m{m}"
             )
         else:
+            best_lr = best_hp.get('lr') if best_hp else 1e-3
+            compile_with_cosine(model_fold, best_lr, len(X_tr_m), CV_EPOCHS)
             es = callbacks.EarlyStopping(monitor="val_loss", patience=10,
                                          restore_best_weights=True)
             model_fold.fit(
@@ -902,6 +948,8 @@ for m in range(N_ENSEMBLE):
         best_epoch_m = int(np.argmin(h_m.history["val_loss"]) + 1)
         best_vloss_m = float(np.min(h_m.history["val_loss"]))
     else:
+        best_lr = best_hp.get('lr') if best_hp else 1e-3
+        compile_with_cosine(model_m, best_lr, len(X_tr_m), FINAL_EPOCHS)
         ckpt_m = os.path.join(EXPORT_DIR, f"best_member_{m+1:02d}.keras")
         mc_m = callbacks.ModelCheckpoint(ckpt_m, monitor='val_loss',
                                          save_best_only=True, verbose=0)
@@ -1014,6 +1062,8 @@ if DO_OPTIONAL_RETRAIN:
                 model_m, X_rt_tr, y_rt_tr, X_rt_val, y_rt_val, f"rt_m{m}"
             )
         else:
+            best_lr = best_hp.get('lr') if best_hp else 1e-3
+            compile_with_cosine(model_m, best_lr, len(X_tr_m), best_epoch_ensemble)
             model_m.fit(
                 X_tr_m, y_tr_m,
                 epochs=best_epoch_ensemble,
@@ -1080,8 +1130,13 @@ baseline_b = keras.Sequential([
     layers.Dense(32, activation="relu"),
     layers.Dense(1)
 ])
+if USE_COSINE_DECAY:
+    _bl_steps = _compute_total_steps(len(X_train), 80)
+    _bl_lr = WarmupCosineDecay(1e-3, _bl_steps, LR_WARMUP_STEPS, COSINE_DECAY_ALPHA)
+else:
+    _bl_lr = 1e-3
 baseline_b.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    optimizer=keras.optimizers.Adam(learning_rate=_bl_lr),
     loss="mse",
     metrics=[keras.metrics.MeanAbsoluteError(name="mae")]
 )
