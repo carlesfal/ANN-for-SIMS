@@ -39,13 +39,13 @@ except Exception:
 
 # --- Install dependencies ---
 if IN_NOTEBOOK:
-    print("Installing (if missing) keras-tuner, seaborn, openpyxl, joblib...")
-    %pip install -q "keras-tuner" seaborn openpyxl joblib
+    print("Installing (if missing) tensorflow, keras-tuner, seaborn, openpyxl, joblib...")
+    %pip install -q tensorflow "keras-tuner" seaborn openpyxl joblib
 else:
     import subprocess, sys
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install",
-         "keras-tuner", "seaborn", "openpyxl", "joblib"]
+         "tensorflow", "keras-tuner", "seaborn", "openpyxl", "joblib"]
     )
 
 # --- Imports ---
