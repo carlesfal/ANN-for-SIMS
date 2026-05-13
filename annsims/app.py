@@ -163,7 +163,6 @@ class ANNSIMSApp(ctk.CTk):
 
         row = add_section(scroll, "Weight Transfer", row)
         row = add_combo(scroll, "Transfer Mode:", "transfer_mode", ["smart", "strict"], row)
-        row = add_check(scroll, "Transfer Best Fold Weights", "transfer_best_fold", row)
 
         row = add_section(scroll, "Prediction Intervals", row)
         row = add_combo(scroll, "PI Calibration:", "pi_calibration", ["val", "oof"], row)
@@ -179,7 +178,6 @@ class ANNSIMSApp(ctk.CTk):
         row = add_entry(scroll, "Grid N (multi):", "grid_n_multi", row)
         row = add_entry(scroll, "Max Pairs:", "max_pairs", row)
         row = add_entry(scroll, "DPI:", "dpi", row)
-        row = add_entry(scroll, "Fig Width (cm):", "fig_width_cm", row)
         row = add_check(scroll, "Overlay Train Scatter", "overlay_train_scatter", row)
         row = add_combo(scroll, "Hold Mode:", "hold_mode",
                         ["median_train", "mean_train", "row"], row)
@@ -498,7 +496,6 @@ class ANNSIMSApp(ctk.CTk):
             text += f"  R2:   {cv['r2_mean']:.4f} +/- {cv['r2_std']:.4f}\n"
             text += f"  RMSE: {cv['rmse_mean']:.4f} +/- {cv['rmse_std']:.4f}\n"
             text += f"  MAE:  {cv['mae_mean']:.4f} +/- {cv['mae_std']:.4f}\n"
-            text += f"  Best Fold R2: {cv['best_fold_r2']:.4f}\n"
             text += f"  Predicted R2 (Q2): {cv['pred_R2']:.4f}\n\n"
 
         for label, metrics in [("Train", runner.metrics_train),
@@ -520,13 +517,15 @@ class ANNSIMSApp(ctk.CTk):
 
         text += "--- Exported Files ---\n"
         text += f"  Directory: {self.config_obj.export_dir}/\n"
-        text += "  - final_model.keras\n"
-        text += "  - scaler_X.pkl\n"
-        text += "  - scaler_y.pkl\n"
-        text += "  - results_train.csv\n"
-        text += "  - results_val.csv\n"
-        text += "  - results_test.csv\n"
-        text += "  - plots_3d/ (TIFF files)\n"
+        text += "  - final_model.keras / .h5\n"
+        text += "  - scaler_X.pkl / scaler_y.pkl\n"
+        text += "  - model_statistics.txt\n"
+        text += "  - model_scheme.txt\n"
+        text += "  - mse_evolution.png\n"
+        text += "  - train/val/test_predictions.xlsx + .csv\n"
+        text += "  - train/val/test_full_with_all_columns.xlsx + .csv\n"
+        text += "  - plots/ (diagnostic plots)\n"
+        text += "  - plots_3d/ (3D surface PNG files)\n"
 
         self.results_text.configure(state="normal")
         self.results_text.delete("1.0", "end")

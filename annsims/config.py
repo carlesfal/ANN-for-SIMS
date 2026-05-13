@@ -15,7 +15,7 @@ class PipelineConfig:
     hill_n: float = 1.20
     hill_x_min: float = 0.1
     hill_x_max: float = 100.0
-    pretrain_epochs: int = 200
+    pretrain_epochs: int = 50
 
     # --- Data split ---
     train_percent: int = 60
@@ -38,7 +38,6 @@ class PipelineConfig:
 
     # --- Weight Transfer ---
     transfer_mode: str = "smart"  # "smart" or "strict"
-    transfer_best_fold: bool = True
 
     # --- Prediction intervals ---
     pi_calibration: str = "val"  # "val" or "oof"
@@ -77,8 +76,7 @@ class PipelineConfig:
     q_high_export: float = 0.98
     hold_mode_export: str = "median_train"
     row_index_export: int = 0
-    dpi: int = 600
-    fig_width_cm: float = 8.3
+    dpi: int = 160
 
     def validate(self):
         """Validate that split percentages sum to 100."""
@@ -88,8 +86,6 @@ class PipelineConfig:
                 f"Split percentages must sum to 100. "
                 f"Got: {self.train_percent}+{self.val_percent}+{self.test_percent}={total}"
             )
-        if self.transfer_mode not in ("smart", "strict"):
-            raise ValueError("transfer_mode must be 'smart' or 'strict'")
         if self.pi_calibration not in ("val", "oof"):
             raise ValueError("pi_calibration must be 'val' or 'oof'")
         return True
