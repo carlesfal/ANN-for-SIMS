@@ -40,12 +40,12 @@ except Exception:
 # --- Install dependencies ---
 if IN_NOTEBOOK:
     print("Installing (if missing) tensorflow, keras-tuner, seaborn, openpyxl, joblib...")
-    %pip install -q tensorflow "keras-tuner" seaborn openpyxl joblib
+    %pip install -q tensorflow "keras-tuner" seaborn openpyxl joblib scipy
 else:
     import subprocess, sys
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install",
-         "tensorflow", "keras-tuner", "seaborn", "openpyxl", "joblib"]
+         "tensorflow", "keras-tuner", "seaborn", "openpyxl", "joblib", "scipy"]
     )
 
 # --- Imports ---
@@ -118,6 +118,13 @@ RANDOM_SEED = 42
 TUNER_EPOCHS = 200
 CV_EPOCHS = 200
 FINAL_EPOCHS = 200
+
+# K-fold CV settings
+CV_PATIENCE = 10              # EarlyStopping patience per fold
+CV_REDUCE_LR_PATIENCE = 5    # ReduceLROnPlateau patience per fold
+CV_REDUCE_LR_FACTOR = 0.5    # LR reduction factor
+CV_MIN_LR = 1e-6             # minimum LR floor
+CV_FINETUNE_LR_FACTOR = 0.2  # multiply tuned LR by this when using pre-trained weights
 
 # Optional retrain on TRAIN+VAL
 DO_OPTIONAL_RETRAIN = True
@@ -564,29 +571,48 @@ print("=" * 70)
 
 
 # =====================================================================
-# PHASE 5: K-FOLD CROSS-VALIDATION (with pre-trained weights)
+# PHASE 5: K-FOLD CROSS-VALIDATION (improved, with pre-trained weights)
 # =====================================================================
 print("\n" + "=" * 70)
 print("PHASE 5: K-FOLD CROSS-VALIDATION (TRAIN split only, no leakage)")
 print("=" * 70)
 
+import time as _time
+from scipy import stats as _scipy_stats
+
 kf = KFold(n_splits=K_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
+# Per-fold metric accumulators
 r2_scores, rmse_scores, mae_scores = [], [], []
+fold_details = []                     # per-fold metadata
 y_oof_pred_inv = np.full(len(y_train_orig), np.nan, dtype=float)
 y_oof_true_inv = np.full(len(y_train_orig), np.nan, dtype=float)
 
+# Best fold tracking
+_best_fold_val_loss = np.inf
+_best_fold_weights = None
+_best_fold_number = -1
+
+# Determine learning rate for CV
+_tuned_lr = best_hp.get('lr')
 if _pretrain_available:
-    print("✓ Will initialise each CV fold with pre-trained weights")
+    _cv_lr = _tuned_lr * CV_FINETUNE_LR_FACTOR
+    print(f"✓ Pre-trained weights available → fine-tuning LR: "
+          f"{_tuned_lr} × {CV_FINETUNE_LR_FACTOR} = {_cv_lr:.2e}")
 else:
-    print("ℹ  Will initialise each CV fold from scratch (no pre-trained weights)")
+    _cv_lr = _tuned_lr
+    print(f"ℹ  No pre-trained weights → using tuned LR: {_cv_lr:.2e}")
 
 print(f"\nRunning {K_FOLDS}-Fold CV with fold-fitted scalers...\n")
+_cv_start = _time.time()
 
 for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
+    _fold_start = _time.time()
+
     X_tr_orig, X_va_orig = X_train_orig[tr_idx], X_train_orig[va_idx]
     y_tr_orig, y_va_orig = y_train_orig[tr_idx], y_train_orig[va_idx]
 
+    # Fold-specific scalers (no leakage)
     fold_scaler_X = StandardScaler().fit(X_tr_orig)
     fold_scaler_y = StandardScaler().fit(y_tr_orig)
 
@@ -595,23 +621,47 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
     y_tr = fold_scaler_y.transform(y_tr_orig)
     y_va = fold_scaler_y.transform(y_va_orig)
 
+    # Build model for this fold
     model_fold = build_model_fixed(best_hp)
 
+    # Transfer pre-trained weights if available
     if _pretrain_available:
         transfer_weights(_model_with_pretrain, model_fold, verbose=False)
 
-    es_cv = callbacks.EarlyStopping(
-        monitor="val_loss", patience=10, restore_best_weights=True
+    # Re-compile with the CV learning rate (fine-tuning or standard)
+    model_fold.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=_cv_lr),
+        loss='mse',
+        metrics=['mae']
     )
-    model_fold.fit(
+
+    # Callbacks: EarlyStopping + ReduceLROnPlateau
+    es_cv = callbacks.EarlyStopping(
+        monitor="val_loss", patience=CV_PATIENCE, restore_best_weights=True
+    )
+    rlr_cv = callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=CV_REDUCE_LR_FACTOR,
+        patience=CV_REDUCE_LR_PATIENCE,
+        min_lr=CV_MIN_LR,
+        verbose=1
+    )
+
+    fold_history = model_fold.fit(
         X_tr, y_tr,
         validation_data=(X_va, y_va),
         epochs=CV_EPOCHS,
         batch_size=32,
-        callbacks=[es_cv],
+        callbacks=[es_cv, rlr_cv],
         verbose=1
     )
 
+    # Fold training metadata
+    fold_epochs_trained = len(fold_history.history['loss'])
+    fold_best_val_loss = min(fold_history.history['val_loss'])
+    fold_best_epoch = int(np.argmin(fold_history.history['val_loss']) + 1)
+
+    # Predict on validation fold (inverse-transform to original units)
     y_va_pred_scaled = model_fold.predict(X_va, verbose=0)
     y_va_pred_inv_fold = fold_scaler_y.inverse_transform(y_va_pred_scaled).reshape(-1)
     y_va_true_inv_fold = y_va_orig.reshape(-1)
@@ -619,6 +669,7 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
     y_oof_pred_inv[va_idx] = y_va_pred_inv_fold
     y_oof_true_inv[va_idx] = y_va_true_inv_fold
 
+    # Fold metrics
     r2 = r2_score(y_va_true_inv_fold, y_va_pred_inv_fold)
     rmse = np.sqrt(mean_squared_error(y_va_true_inv_fold, y_va_pred_inv_fold))
     mae = np.mean(np.abs(y_va_true_inv_fold - y_va_pred_inv_fold))
@@ -626,20 +677,206 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
     r2_scores.append(r2)
     rmse_scores.append(rmse)
     mae_scores.append(mae)
-    print(f"Fold {fold}: R²={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}")
 
-print("\nCV Metrics (Mean ± Std) on TRAIN split (no leakage):")
-print(f"R²:   {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}")
-print(f"RMSE: {np.mean(rmse_scores):.4f} ± {np.std(rmse_scores):.4f}")
-print(f"MAE:  {np.mean(mae_scores):.4f} ± {np.std(mae_scores):.4f}")
+    _fold_time = _time.time() - _fold_start
+    fold_details.append({
+        "fold": fold,
+        "R2": r2,
+        "RMSE": rmse,
+        "MAE": mae,
+        "best_val_loss": fold_best_val_loss,
+        "best_epoch": fold_best_epoch,
+        "epochs_trained": fold_epochs_trained,
+        "n_train": len(tr_idx),
+        "n_val": len(va_idx),
+        "time_sec": round(_fold_time, 1)
+    })
 
+    print(f"Fold {fold}/{K_FOLDS}: R²={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f} "
+          f"| best_epoch={fold_best_epoch}/{fold_epochs_trained} "
+          f"| val_loss={fold_best_val_loss:.6f} | {_fold_time:.1f}s")
+
+    # Track best fold model
+    if fold_best_val_loss < _best_fold_val_loss:
+        _best_fold_val_loss = fold_best_val_loss
+        _best_fold_weights = model_fold.get_weights()
+        _best_fold_number = fold
+
+_cv_total_time = _time.time() - _cv_start
+print(f"\nTotal CV time: {_cv_total_time:.1f}s")
+
+# --- Per-fold summary table ---
+cv_summary_df = pd.DataFrame(fold_details)
+print("\n=== Per-Fold Summary ===")
+_show(cv_summary_df)
+
+# --- Aggregate CV metrics with 95% confidence intervals ---
+def _ci_95(values):
+    """Compute 95% CI for the mean using t-distribution."""
+    n = len(values)
+    mean = np.mean(values)
+    se = np.std(values, ddof=1) / np.sqrt(n) if n > 1 else np.nan
+    t_crit = _scipy_stats.t.ppf(0.975, df=n - 1) if n > 1 else np.nan
+    return mean, mean - t_crit * se, mean + t_crit * se
+
+r2_mean, r2_ci_lo, r2_ci_hi = _ci_95(r2_scores)
+rmse_mean, rmse_ci_lo, rmse_ci_hi = _ci_95(rmse_scores)
+mae_mean, mae_ci_lo, mae_ci_hi = _ci_95(mae_scores)
+
+print("\n=== CV Metrics (Mean ± Std) [95% CI] on TRAIN split (no leakage) ===")
+print(f"R²:   {r2_mean:.4f} ± {np.std(r2_scores):.4f}  "
+      f"[{r2_ci_lo:.4f}, {r2_ci_hi:.4f}]")
+print(f"RMSE: {rmse_mean:.4f} ± {np.std(rmse_scores):.4f}  "
+      f"[{rmse_ci_lo:.4f}, {rmse_ci_hi:.4f}]")
+print(f"MAE:  {mae_mean:.4f} ± {np.std(mae_scores):.4f}  "
+      f"[{mae_ci_lo:.4f}, {mae_ci_hi:.4f}]")
+
+# --- Fold stability analysis ---
+def _cv_pct(values):
+    """Coefficient of variation (%)."""
+    m = np.mean(values)
+    return 100.0 * np.std(values) / abs(m) if abs(m) > 1e-12 else np.nan
+
+cv_r2  = _cv_pct(r2_scores)
+cv_rmse = _cv_pct(rmse_scores)
+cv_mae  = _cv_pct(mae_scores)
+
+print(f"\nFold stability (CV%): R²={cv_r2:.1f}%, RMSE={cv_rmse:.1f}%, MAE={cv_mae:.1f}%")
+if cv_r2 > 30:
+    print("⚠️  High R² variability across folds — consider more data or simpler model")
+elif cv_r2 > 15:
+    print("ℹ  Moderate R² variability — results are reasonable but not highly stable")
+else:
+    print("✓  Low R² variability — fold results are stable")
+
+# Flag outlier folds (R² more than 2σ from mean)
+_r2_mean_val = np.mean(r2_scores)
+_r2_std_val = np.std(r2_scores)
+if _r2_std_val > 1e-12:
+    outlier_folds = [
+        fd["fold"] for fd, r2v in zip(fold_details, r2_scores)
+        if abs(r2v - _r2_mean_val) > 2 * _r2_std_val
+    ]
+    if outlier_folds:
+        print(f"⚠️  Outlier fold(s) (R² > 2σ from mean): {outlier_folds}")
+
+print(f"\nBest fold: {_best_fold_number} (val_loss={_best_fold_val_loss:.6f})")
+
+# --- OOF validation ---
 if np.isnan(y_oof_pred_inv).any():
     raise RuntimeError("OOF predictions contain NaNs. Check fold logic.")
 
+# --- Predicted R² (Q²) ---
 ss_res_press = np.sum((y_oof_true_inv - y_oof_pred_inv) ** 2)
 ss_tot_train = np.sum((y_oof_true_inv - np.mean(y_oof_true_inv)) ** 2)
 pred_R2_train = 1.0 - ss_res_press / ss_tot_train if ss_tot_train != 0 else np.nan
 print(f"\nPredicted R² (Q²) on TRAIN split (OOF/PRESS, no leakage): {pred_R2_train:.4f}")
+
+# --- OOF residual diagnostics ---
+oof_residuals = y_oof_true_inv - y_oof_pred_inv
+oof_abs_res = np.abs(oof_residuals)
+
+print("\n=== OOF Residual Diagnostics ===")
+print(f"  Mean residual:    {np.mean(oof_residuals):.4f} "
+      f"(should be ≈0; bias if far from 0)")
+print(f"  Std residual:     {np.std(oof_residuals):.4f}")
+print(f"  Median |residual|:{np.median(oof_abs_res):.4f}")
+print(f"  Max |residual|:   {np.max(oof_abs_res):.4f}")
+
+try:
+    _skew = _scipy_stats.skew(oof_residuals)
+    _kurt = _scipy_stats.kurtosis(oof_residuals)
+    print(f"  Skewness:         {_skew:.4f} "
+          f"({'symmetric' if abs(_skew) < 0.5 else 'skewed'})")
+    print(f"  Kurtosis:         {_kurt:.4f} "
+          f"({'normal tails' if abs(_kurt) < 1 else 'heavy tails' if _kurt > 1 else 'light tails'})")
+except Exception:
+    pass
+
+# Outlier count (|residual| > 3σ)
+_oof_3sigma = np.std(oof_residuals) * 3
+n_outliers = int(np.sum(oof_abs_res > _oof_3sigma))
+print(f"  Outliers (>3σ):   {n_outliers}/{len(oof_residuals)} "
+      f"({100*n_outliers/len(oof_residuals):.1f}%)")
+
+# --- OOF Predicted vs Actual plot ---
+try:
+    _oof_plots_dir = os.path.join(EXPORT_DIR, "plots")
+    os.makedirs(_oof_plots_dir, exist_ok=True)
+    _oof_plot_path = os.path.join(_oof_plots_dir, "oof_predicted_vs_actual.png")
+
+    plt.figure(figsize=(7, 7))
+    plt.scatter(y_oof_true_inv, y_oof_pred_inv, alpha=0.5, s=20, edgecolors='k', linewidths=0.3)
+    _mn = min(np.min(y_oof_true_inv), np.min(y_oof_pred_inv))
+    _mx = max(np.max(y_oof_true_inv), np.max(y_oof_pred_inv))
+    plt.plot([_mn, _mx], [_mn, _mx], 'r--', lw=1.5, label='Ideal')
+    try:
+        sns.regplot(x=y_oof_true_inv, y=y_oof_pred_inv, scatter=False, color='blue', ci=None)
+    except Exception:
+        pass
+    plt.title(f"OOF Predicted vs Actual (Q²={pred_R2_train:.4f})\n"
+              f"{K_FOLDS}-Fold CV, no leakage")
+    plt.xlabel("Actual Value")
+    plt.ylabel("OOF Predicted Value")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(_oof_plot_path, dpi=150)
+    if IN_NOTEBOOK:
+        plt.show()
+    else:
+        plt.close()
+    print(f"\nOOF plot saved to: {_oof_plot_path}")
+except Exception as e:
+    print(f"Error creating OOF plot: {e}")
+
+# --- OOF Residual distribution plot ---
+try:
+    _oof_res_path = os.path.join(_oof_plots_dir, "oof_residual_distribution.png")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Histogram
+    sns.histplot(oof_residuals, bins=30, kde=True, color='steelblue',
+                 edgecolor='black', ax=axes[0])
+    axes[0].axvline(0, color='red', linestyle='--', lw=1)
+    axes[0].set_title("OOF Residual Distribution")
+    axes[0].set_xlabel("Residual (Actual - Predicted)")
+    axes[0].set_ylabel("Frequency")
+    axes[0].grid(True, alpha=0.3)
+
+    # Q-Q plot
+    _scipy_stats.probplot(oof_residuals, dist="norm", plot=axes[1])
+    axes[1].set_title("OOF Residual Q-Q Plot")
+    axes[1].grid(True, alpha=0.3)
+
+    # Residual vs predicted
+    axes[2].scatter(y_oof_pred_inv, oof_residuals, alpha=0.5, s=15,
+                    edgecolors='k', linewidths=0.3)
+    axes[2].axhline(0, color='red', linestyle='--', lw=1)
+    axes[2].set_title("OOF Residuals vs Predicted")
+    axes[2].set_xlabel("OOF Predicted Value")
+    axes[2].set_ylabel("Residual")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(_oof_res_path, dpi=150)
+    if IN_NOTEBOOK:
+        plt.show()
+    else:
+        plt.close()
+    print(f"OOF residual plots saved to: {_oof_res_path}")
+except Exception as e:
+    print(f"Error creating OOF residual plots: {e}")
+
+# Save CV summary to file
+try:
+    cv_summary_path = os.path.join(EXPORT_DIR, "cv_fold_summary.csv")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    cv_summary_df.to_csv(cv_summary_path, index=False)
+    print(f"CV fold summary saved to: {cv_summary_path}")
+except Exception as e:
+    print(f"Error saving CV summary: {e}")
 
 
 # =====================================================================
@@ -886,6 +1123,17 @@ try:
         f.write(f"Best epoch selected on VAL loss: {best_epoch}\n")
         f.write(f"Optional retrain on train+val: {DO_OPTIONAL_RETRAIN}\n")
         f.write(f"PI calibration source: {PI_CALIBRATION}, alpha={PI_ALPHA}\n")
+        f.write(f"\nK-Fold CV Summary ({K_FOLDS} folds):\n")
+        f.write(f"  R²:   {r2_mean:.4f} ± {np.std(r2_scores):.4f}  "
+                f"[95% CI: {r2_ci_lo:.4f}, {r2_ci_hi:.4f}]\n")
+        f.write(f"  RMSE: {rmse_mean:.4f} ± {np.std(rmse_scores):.4f}  "
+                f"[95% CI: {rmse_ci_lo:.4f}, {rmse_ci_hi:.4f}]\n")
+        f.write(f"  MAE:  {mae_mean:.4f} ± {np.std(mae_scores):.4f}  "
+                f"[95% CI: {mae_ci_lo:.4f}, {mae_ci_hi:.4f}]\n")
+        f.write(f"  Fold stability (CV%): R²={cv_r2:.1f}%, RMSE={cv_rmse:.1f}%, MAE={cv_mae:.1f}%\n")
+        f.write(f"  Best fold: {_best_fold_number} (val_loss={_best_fold_val_loss:.6f})\n")
+        f.write(f"  OOF residual skewness: {_scipy_stats.skew(oof_residuals):.4f}\n")
+        f.write(f"  OOF residual kurtosis: {_scipy_stats.kurtosis(oof_residuals):.4f}\n")
     print(f"Model statistics saved to: {stats_path}")
 except Exception as e:
     print("Could not save model statistics file:", e)
@@ -1358,6 +1606,7 @@ training_files = [
     os.path.join(EXPORT_DIR, "final_model.h5"),
     os.path.join(EXPORT_DIR, "scaler_X.pkl"),
     os.path.join(EXPORT_DIR, "scaler_y.pkl"),
+    os.path.join(EXPORT_DIR, "cv_fold_summary.csv"),
 ]
 
 plots_dir = os.path.join(EXPORT_DIR, "plots")
