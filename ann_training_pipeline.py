@@ -173,6 +173,12 @@ TUNER_TRIALS = 10
 TUNER_EPOCHS = 200
 BATCH_SIZE = 32
 
+# --- Architecture search (tuner explores flexible depth/width) ---
+TUNER_MIN_LAYERS = 2              # Minimum hidden dense layers
+TUNER_MAX_LAYERS = 6              # Maximum hidden dense layers
+TUNER_UNIT_CHOICES = [32, 64, 128, 256, 512]  # Available units per layer
+MAX_FT_STAGES = 5                 # Maximum gradual unfreezing stages
+
 # --- K-fold CV ---
 K_FOLDS = 10
 CV_EPOCHS = 120
@@ -188,17 +194,11 @@ USE_STAGED_FINETUNING = True    # If False, use simple training (Cell 2 style)
 
 USE_HUBER_LOSS = True
 HUBER_DELTA    = 1.0
-# Gradual unfreezing: 5 stages (output → dense_32 → dense_64 → dense_128 → all)
-EPOCHS_S1 = 10    # output head only
-EPOCHS_S2 = 12    # dense_32 + head
-EPOCHS_S3 = 15    # dense_64 + dense_32 + head
-EPOCHS_S4 = 18    # dense_128 + dense_64 + dense_32 + head
-EPOCHS_S5 = 35    # full unfreeze with discriminative LR
-LR_S1 = 8e-4
-LR_S2 = 5e-4
-LR_S3 = 3e-4
-LR_S4 = 1.5e-4
-LR_S5 = 6e-5
+# Gradual unfreezing: dynamic stages (adapts to model depth)
+EPOCHS_S1 = 10    # first stage (output head only)
+EPOCHS_S_LAST = 35  # last stage (full unfreeze)
+LR_S1 = 8e-4       # LR for first stage (output head)
+LR_S_LAST = 6e-5   # LR for last stage (full unfreeze)
 LR_DISCRIM_FACTOR = 0.4   # Each lower layer gets LR * factor^(distance_from_head)
 LR_WARMUP_STEPS = 50      # Linear warmup steps at start of each stage
 CLIPNORM      = 1.0
@@ -561,24 +561,39 @@ print(f"Pretrain epochs ran: {len(hist_pre.history['val_loss'])}")
 
 
 # =====================================================================
-# PHASE 4: HYPERPARAMETER TUNING (fixed architecture, tune dropout/l2/lr)
+# PHASE 4: HYPERPARAMETER TUNING (flexible architecture: layers, units, dropout, l2, lr)
 # =====================================================================
 print("\n" + "=" * 70)
-print("PHASE 4: HYPERPARAMETER TUNING")
+print("PHASE 4: HYPERPARAMETER TUNING (flexible architecture)")
 print("=" * 70)
 
 def build_model_tunable(hp):
-    l2_val = hp.Float('l2_reg', 1e-6, 1e-2, sampling='log')
-    d1     = hp.Float('dropout_1', 0.10, 0.40, step=0.05)
-    d2     = hp.Float('dropout_2', 0.10, 0.35, step=0.05)
-    d3     = hp.Float('dropout_3', 0.05, 0.30, step=0.05)
-    d4     = hp.Float('dropout_4', 0.00, 0.25, step=0.05)
-    d5     = hp.Float('dropout_5', 0.00, 0.20, step=0.05)
-    lr     = hp.Float('lr', 1e-5, 3e-3, sampling='log')
+    """Build model with tunable depth, width, dropout, regularization, and LR."""
+    n_layers = hp.Int('n_layers', TUNER_MIN_LAYERS, TUNER_MAX_LAYERS)
+    l2_val   = hp.Float('l2_reg', 1e-6, 1e-2, sampling='log')
+    lr       = hp.Float('lr', 1e-5, 3e-3, sampling='log')
+
+    model = keras.Sequential()
+    model.add(layers.Input(shape=(n_real_inputs,)))
+    for i in range(n_layers):
+        units   = hp.Choice(f'units_{i}', TUNER_UNIT_CHOICES)
+        dropout = hp.Float(f'dropout_{i}', 0.0, 0.40, step=0.05)
+        model.add(layers.Dense(units, activation='relu',
+                               kernel_regularizer=regularizers.l2(l2_val),
+                               name=f"dense_{i}"))
+        model.add(layers.Dropout(dropout, name=f"drop_{i}"))
+    model.add(layers.Dense(1, activation='linear', name="dense_out"))
+
     tuner_total_steps = _compute_total_steps(len(X_train), TUNER_EPOCHS)
-    return build_base_model(n_real_inputs, l2_val=l2_val,
-                            d1=d1, d2=d2, d3=d3, d4=d4, d5=d5, lr=lr,
-                            total_steps_hint=tuner_total_steps)
+    if USE_COSINE_DECAY:
+        lr_schedule = WarmupCosineDecay(lr, tuner_total_steps, LR_WARMUP_STEPS, COSINE_DECAY_ALPHA)
+    else:
+        lr_schedule = lr
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+        loss='mse', metrics=['mae']
+    )
+    return model
 
 tuner = kt.RandomSearch(
     build_model_tunable,
@@ -612,6 +627,13 @@ print("\nBest hyperparameters found:")
 for k, v in best_hp.values.items():
     print(f"  {k}: {v}")
 
+# Show discovered architecture
+_best_nlayers = best_hp.get('n_layers')
+_arch_str = " → ".join(
+    str(best_hp.get(f'units_{i}')) for i in range(_best_nlayers)
+)
+print(f"\nBest architecture: [{_arch_str}] → 1 ({_best_nlayers} hidden layers)")
+
 
 # =====================================================================
 # PHASE 5: WEIGHT TRANSFER (warmup → tuned architecture)
@@ -622,37 +644,58 @@ print("=" * 70)
 
 def transfer_weights(source_model, target_model, blend_alpha=None, verbose=True):
     """
-    Transfer Dense layer weights by name where shapes match.
+    Transfer Dense layer weights using name match first, then shape match.
 
-    If blend_alpha is set (0 < alpha <= 1), the transferred weights are blended:
-        final_weights = alpha * source_weights + (1 - alpha) * target_random_init
-    This preserves some diversity from the random initialization while benefiting
-    from the pre-trained representations. alpha=1.0 means full transfer (legacy).
+    Works across different architectures: the warmup model (fixed 5-layer) can
+    transfer weights to any tuner-discovered architecture by matching layers
+    with compatible shapes (e.g., warmup dense_128 → tuned dense_2 if both 128 units).
+
+    blend_alpha (0 < alpha <= 1): blends pretrained + random-init weights.
     """
-    source_dense = {l.name: l for l in source_model.layers if isinstance(l, layers.Dense)}
-    target_dense = {l.name: l for l in target_model.layers if isinstance(l, layers.Dense)}
+    source_dense = [l for l in source_model.layers if isinstance(l, layers.Dense)]
+    target_dense = [l for l in target_model.layers if isinstance(l, layers.Dense)]
     n_transferred = 0
-    for name, t_layer in target_dense.items():
-        if name not in source_dense:
-            continue
-        s_layer = source_dense[name]
-        s_w = s_layer.get_weights()
-        t_w = t_layer.get_weights()
-        same = (len(s_w) == len(t_w)) and all(a.shape == b.shape for a, b in zip(s_w, t_w))
-        if same:
-            if blend_alpha is not None and blend_alpha < 1.0:
-                blended = [blend_alpha * sw + (1.0 - blend_alpha) * tw
-                           for sw, tw in zip(s_w, t_w)]
-                t_layer.set_weights(blended)
-            else:
-                t_layer.set_weights(s_w)
-            n_transferred += 1
-            if verbose:
-                alpha_str = f" (blend={blend_alpha:.2f})" if blend_alpha and blend_alpha < 1.0 else ""
-                print(f"  Transferred {name}{alpha_str}")
+    used_source = set()
+    transferred_target = set()
+
+    def _shapes_match(s_layer, t_layer):
+        s_w, t_w = s_layer.get_weights(), t_layer.get_weights()
+        return (len(s_w) == len(t_w)) and all(a.shape == b.shape for a, b in zip(s_w, t_w))
+
+    def _do_transfer(s_layer, t_layer, match_type):
+        nonlocal n_transferred
+        s_w, t_w = s_layer.get_weights(), t_layer.get_weights()
+        if blend_alpha is not None and blend_alpha < 1.0:
+            t_layer.set_weights([blend_alpha * sw + (1 - blend_alpha) * tw
+                                 for sw, tw in zip(s_w, t_w)])
         else:
-            if verbose:
-                print(f"  Shape mismatch {name}")
+            t_layer.set_weights(s_w)
+        n_transferred += 1
+        used_source.add(id(s_layer))
+        transferred_target.add(id(t_layer))
+        if verbose:
+            alpha_str = f" blend={blend_alpha:.2f}" if blend_alpha and blend_alpha < 1.0 else ""
+            print(f"  {s_layer.name} → {t_layer.name} ({match_type}{alpha_str})")
+
+    # Pass 1: exact name match (handles dense_out and same-named layers)
+    source_by_name = {l.name: l for l in source_dense}
+    for t_layer in target_dense:
+        if t_layer.name in source_by_name:
+            s_layer = source_by_name[t_layer.name]
+            if _shapes_match(s_layer, t_layer):
+                _do_transfer(s_layer, t_layer, "name")
+
+    # Pass 2: shape match for remaining layers (output→input order)
+    remaining_source = [l for l in reversed(source_dense) if id(l) not in used_source]
+    remaining_target = [l for l in reversed(target_dense) if id(l) not in transferred_target]
+    for t_layer in remaining_target:
+        for s_layer in remaining_source:
+            if id(s_layer) in used_source:
+                continue
+            if _shapes_match(s_layer, t_layer):
+                _do_transfer(s_layer, t_layer, "shape")
+                break
+
     return n_transferred
 
 def validate_transfer(model_before, model_after, X_val_data, y_val_data):
@@ -739,15 +782,20 @@ def compile_with_cosine(model, lr, n_samples, epochs):
 
 def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
     """
-    5-stage gradual unfreezing with warmup + cosine decay per stage:
-      S1: output head only (dense_out)
-      S2: dense_32 + head
-      S3: dense_64 + dense_32 + head
-      S4: dense_128 + dense_64 + dense_32 + head
-      S5: full unfreeze (lower base LR for discriminative effect)
+    Dynamic N-stage gradual unfreezing with warmup + cosine decay.
+    Adapts to the model's actual depth (works with any architecture from the tuner).
+    Stages: output head → progressively unfreeze hidden layers → full unfreeze.
+    LR decreases geometrically, epochs increase linearly across stages.
     """
     dense_layers = [l for l in model.layers if isinstance(l, layers.Dense)]
+    n_dense = len(dense_layers)
+    n_hidden = n_dense - 1  # exclude output head
     n_train = len(X_tr)
+    n_stages = min(n_hidden + 1, MAX_FT_STAGES)  # cap stages
+
+    # Interpolate LR (geometric) and epochs (linear) across stages
+    stage_lrs = np.geomspace(LR_S1, LR_S_LAST, n_stages)
+    stage_epochs = np.linspace(EPOCHS_S1, EPOCHS_S_LAST, n_stages).astype(int)
 
     def _stage_callbacks():
         return [
@@ -756,53 +804,27 @@ def staged_finetune(model, X_tr, y_tr, X_v, y_v, member_id):
             callbacks.TerminateOnNaN()
         ]
 
-    # S1: output head only (dense_out)
-    for l in model.layers:
-        l.trainable = False
-    dense_layers[-1].trainable = True
-    compile_for_ft(model, LR_S1, _compute_total_steps(n_train, EPOCHS_S1), LR_WARMUP_STEPS)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S1, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks(), verbose=0)
+    h = None
+    for s in range(n_stages):
+        for l in model.layers:
+            l.trainable = False
 
-    # S2: dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    if len(dense_layers) >= 2:
-        dense_layers[-2].trainable = True
-    dense_layers[-1].trainable = True
-    compile_for_ft(model, LR_S2, _compute_total_steps(n_train, EPOCHS_S2), LR_WARMUP_STEPS)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S2, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks(), verbose=0)
+        if s < n_stages - 1:
+            # Unfreeze last (s+1) dense layers (output + s hidden layers from bottom)
+            n_unfreeze = min(s + 1, n_dense)
+            for dl in dense_layers[-n_unfreeze:]:
+                dl.trainable = True
+        else:
+            # Final stage: full unfreeze
+            for l in model.layers:
+                l.trainable = True
 
-    # S3: dense_64 + dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    for dl in dense_layers[-3:]:
-        dl.trainable = True
-    compile_for_ft(model, LR_S3, _compute_total_steps(n_train, EPOCHS_S3), LR_WARMUP_STEPS)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S3, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks(), verbose=0)
-
-    # S4: dense_128 + dense_64 + dense_32 + head
-    for l in model.layers:
-        l.trainable = False
-    for dl in dense_layers[-4:]:
-        dl.trainable = True
-    compile_for_ft(model, LR_S4, _compute_total_steps(n_train, EPOCHS_S4), LR_WARMUP_STEPS)
-    model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-              epochs=EPOCHS_S4, batch_size=BATCH_SIZE,
-              callbacks=_stage_callbacks(), verbose=0)
-
-    # S5: full unfreeze with lower base LR (discriminative effect)
-    for l in model.layers:
-        l.trainable = True
-    compile_for_ft(model, LR_S5, _compute_total_steps(n_train, EPOCHS_S5), LR_WARMUP_STEPS)
-    h = model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
-                  epochs=EPOCHS_S5, batch_size=BATCH_SIZE,
-                  callbacks=_stage_callbacks(), verbose=0)
+        lr_s = float(stage_lrs[s])
+        epochs_s = int(stage_epochs[s])
+        compile_for_ft(model, lr_s, _compute_total_steps(n_train, epochs_s), LR_WARMUP_STEPS)
+        h = model.fit(X_tr, y_tr, validation_data=(X_v, y_v),
+                      epochs=epochs_s, batch_size=BATCH_SIZE,
+                      callbacks=_stage_callbacks(), verbose=0)
 
     return model, h
 
