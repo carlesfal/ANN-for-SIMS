@@ -10,20 +10,30 @@ Desktop application for training Artificial Neural Networks to predict SIMS (Sec
 - **K-Fold Cross-Validation**: Strict no-leakage CV with per-fold scaling
 - **Final Training**: Best-fold seeding with optional retrain on Train+Val
 - **Prediction Intervals**: Empirical calibration (val or OOF residuals)
-- **3D Surface Plots**: Exported as high-DPI TIFF for all feature pairs
+- **3D Surface Plots**: Exported as high-DPI PNG for all feature pairs
 - **Desktop GUI**: Configure all parameters, load data, run training, and view results
 
 ## Installation
 
 ```bash
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### Requirements
 
-- Python 3.9+
+- **Python 3.9–3.12** (TensorFlow does not yet support Python 3.13+)
 - TensorFlow 2.10+
 - Tkinter (included with most Python installations)
+
+> **Tip:** If your system Python is 3.13+, create a virtual environment with a compatible version:
+> ```bash
+> # Using conda:
+> conda create -n annsims python=3.11 -y && conda activate annsims
+> # Or using pyenv:
+> pyenv install 3.11.9 && pyenv local 3.11.9
+> ```
 
 ## Usage
 
@@ -52,8 +62,13 @@ All results are saved to the configured export directory (default: `optimized_mo
 
 - `final_model.keras` / `final_model.h5` - Trained model
 - `scaler_X.pkl`, `scaler_y.pkl` - Fitted scalers
-- `results_train.csv`, `results_val.csv`, `results_test.csv` - Predictions with PI
-- `plots_3d/` - 3D surface plots as TIFF files
+- `model_statistics.txt` - Hyperparameters and metrics summary
+- `model_scheme.txt` - Network architecture documentation
+- `mse_evolution.png` - Training loss evolution plot
+- `{train,val,test}_predictions.xlsx` / `.csv` - Predictions with prediction intervals
+- `{train,val,test}_full_with_all_columns.xlsx` / `.csv` - Full-row exports
+- `plots/` - Diagnostic plots (pred vs actual, residuals)
+- `plots_3d/` - 3D surface plots as PNG files
 
 ## Pipeline Phases
 
