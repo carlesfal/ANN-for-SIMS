@@ -9,10 +9,9 @@
 #   Phase 4: Refined weight transfer (shape-aware, applied at every stage)
 #   Phase 5: K-fold cross-validation with pre-trained weights
 #   Phase 6: Final training with pre-trained weights
-#   Phase 7: Optional retrain on train+val with pre-trained weights
-#   Phase 8: Evaluation, metrics, diagnostic plots, exports
-#   Phase 9: 3D surface plots
-#   Phase 10: New data predictions with empirical prediction intervals
+#   Phase 7: Evaluation, metrics, diagnostic plots, exports
+#   Phase 8: 3D surface plots
+#   Phase 9: New data predictions with empirical prediction intervals
 #
 # WEIGHT TRANSFER REFINEMENTS vs. original two-cell approach:
 #   1. Centralised transfer_weights() with per-layer shape validation
@@ -23,7 +22,7 @@
 #   5. Graceful fallback to random init if architectures diverge
 #
 # STRICT NO-LEAKAGE evaluation:
-#   - Scalers fit only on TRAIN (or TRAIN+VAL for optional retrain)
+#   - Scalers fit only on TRAIN
 #   - CV inside TRAIN with fold-fitted scalers
 #   - TEST evaluated once, never used for selection
 #
@@ -104,9 +103,8 @@ N_INPUTS = 10
 TARGET_COL = None
 SEP = "\t"
 
-# Split percentages
-TRAIN_PERCENT = 60
-VAL_PERCENT = 20
+# Split percentages (TRAIN + TEST = 100)
+TRAIN_PERCENT = 80
 TEST_PERCENT = 20
 
 DISABLE_GPU = True
@@ -126,11 +124,7 @@ CV_REDUCE_LR_FACTOR = 0.5    # LR reduction factor
 CV_MIN_LR = 1e-6             # minimum LR floor
 CV_FINETUNE_LR_FACTOR = 0.2  # multiply tuned LR by this when using pre-trained weights
 
-# Optional retrain on TRAIN+VAL
-DO_OPTIONAL_RETRAIN = True
-
 # Prediction-interval calibration
-PI_CALIBRATION = "val"   # "val" or "oof"
 PI_ALPHA = 0.05          # 95 % PI
 
 EXPORT_DIR = "optimized_model"
@@ -159,14 +153,14 @@ MAX_PAIRS_3D = 12
 # =====================================================================
 
 # Validate split
-total_percent = TRAIN_PERCENT + VAL_PERCENT + TEST_PERCENT
+total_percent = TRAIN_PERCENT + TEST_PERCENT
 if abs(total_percent - 100) > 0.01:
     raise ValueError(
         f"Split percentages must sum to 100. "
-        f"Got: {TRAIN_PERCENT}% + {VAL_PERCENT}% + {TEST_PERCENT}% = {total_percent}%"
+        f"Got: {TRAIN_PERCENT}% + {TEST_PERCENT}% = {total_percent}%"
     )
 
-print(f"✓ Data split: TRAIN={TRAIN_PERCENT}%, VAL={VAL_PERCENT}%, TEST={TEST_PERCENT}%")
+print(f"✓ Data split: TRAIN={TRAIN_PERCENT}%, TEST={TEST_PERCENT}%")
 
 np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
@@ -410,28 +404,19 @@ row_pos = np.arange(len(df))
 
 # --- Configurable split ---
 test_frac = TEST_PERCENT / 100.0
-val_frac = VAL_PERCENT / 100.0
-train_frac = TRAIN_PERCENT / 100.0
 
-X_temp, X_test_orig, y_temp, y_test_orig, labels_temp, labels_test, idx_temp, idx_test = \
+X_train_orig, X_test_orig, y_train_orig, y_test_orig, labels_train, labels_test, idx_train, idx_test = \
     train_test_split(X_full, y_full_arr, labels_full, row_pos,
                      test_size=test_frac, random_state=RANDOM_SEED)
 
-val_split_ratio = val_frac / (train_frac + val_frac)
-X_train_orig, X_val_orig, y_train_orig, y_val_orig, labels_train, labels_val, idx_train, idx_val = \
-    train_test_split(X_temp, y_temp, labels_temp, idx_temp,
-                     test_size=val_split_ratio, random_state=RANDOM_SEED)
-
 inputs_columns = list(inputs_df.columns)
 X_train_df = pd.DataFrame(X_train_orig, columns=inputs_columns).reset_index(drop=True)
-X_val_df   = pd.DataFrame(X_val_orig,   columns=inputs_columns).reset_index(drop=True)
 X_test_df  = pd.DataFrame(X_test_orig,  columns=inputs_columns).reset_index(drop=True)
 
 print(f"\nSplit sizes (rows): train={len(X_train_orig)} "
-      f"val={len(X_val_orig)} test={len(X_test_orig)}")
+      f"test={len(X_test_orig)}")
 print(f"Split percentages: "
       f"train={100*len(X_train_orig)/len(df):.1f}% "
-      f"val={100*len(X_val_orig)/len(df):.1f}% "
       f"test={100*len(X_test_orig)/len(df):.1f}%")
 
 # --- Scaling (fit on TRAIN only — no leakage) ---
@@ -439,11 +424,9 @@ scaler_X = StandardScaler().fit(X_train_orig)
 scaler_y = StandardScaler().fit(y_train_orig)
 
 X_train = scaler_X.transform(X_train_orig)
-X_val   = scaler_X.transform(X_val_orig)
 X_test  = scaler_X.transform(X_test_orig)
 
 y_train = scaler_y.transform(y_train_orig)
-y_val   = scaler_y.transform(y_val_orig)
 y_test  = scaler_y.transform(y_test_orig)
 
 # Validate that Hill pre-training input dimension matches real data
@@ -501,6 +484,7 @@ def build_model_fixed(hp):
 
 
 print(f"\n[1/2] Running hyperparameter search ({TUNER_TRIALS} trials)...")
+print("  Using validation_split=0.2 from TRAIN for tuner internal validation")
 
 tuner = kt.RandomSearch(
     build_model_fixed,
@@ -508,12 +492,12 @@ tuner = kt.RandomSearch(
     max_trials=TUNER_TRIALS,
     executions_per_trial=1,
     directory='tuner_results',
-    project_name=f'ann_{TRAIN_PERCENT}_{VAL_PERCENT}_{TEST_PERCENT}'
+    project_name=f'ann_{TRAIN_PERCENT}_{TEST_PERCENT}'
 )
 
 tuner.search(
     X_train, y_train,
-    validation_data=(X_val, y_val),
+    validation_split=0.2,
     epochs=TUNER_EPOCHS,
     batch_size=32,
     verbose=1
@@ -883,17 +867,16 @@ except Exception as e:
 # PHASE 6: FINAL TRAINING (with pre-trained weights)
 # =====================================================================
 print("\n" + "=" * 70)
-print("PHASE 6: FINAL TRAINING (fit on TRAIN, validate on VAL)")
+print("PHASE 6: FINAL TRAINING (fit on TRAIN, epoch count from CV)")
 print("=" * 70)
 
+# Use median best_epoch from CV folds as the training duration
+_cv_best_epochs = [fd["best_epoch"] for fd in fold_details]
+best_epoch = int(np.median(_cv_best_epochs))
+print(f"Best epoch determined from CV folds (median): {best_epoch}")
+print(f"  (fold best epochs: {_cv_best_epochs})")
+
 os.makedirs(EXPORT_DIR, exist_ok=True)
-checkpoint_path = os.path.join(EXPORT_DIR, "best_model.keras")
-mc = callbacks.ModelCheckpoint(
-    checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1
-)
-es_final = callbacks.EarlyStopping(
-    monitor='val_loss', patience=20, restore_best_weights=True
-)
 
 tf.keras.backend.clear_session()
 model = build_model_fixed(best_hp)
@@ -906,20 +889,24 @@ if _pretrain_available:
 else:
     print("Training final model from random initialisation\n")
 
+# Re-compile with fine-tuning LR if pre-trained
+_final_lr = best_hp.get('lr') * CV_FINETUNE_LR_FACTOR if _pretrain_available else best_hp.get('lr')
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=_final_lr),
+    loss='mse',
+    metrics=['mae']
+)
+print(f"Final training LR: {_final_lr:.2e}")
+
 history = model.fit(
     X_train, y_train,
-    validation_data=(X_val, y_val),
-    epochs=FINAL_EPOCHS,
+    epochs=best_epoch,
     batch_size=32,
-    callbacks=[es_final, mc],
     verbose=1
 )
 
-if os.path.exists(checkpoint_path):
-    model = keras.models.load_model(checkpoint_path, compile=False)
-
-best_epoch = int(np.argmin(history.history["val_loss"]) + 1)
-print(f"\nBest epoch selected by VAL loss: {best_epoch}")
+# Save model
+model.save(os.path.join(EXPORT_DIR, "best_model.keras"))
 
 # Evaluate ONCE on TEST
 print("\nEvaluating once on TEST (no selection/tuning on test).")
@@ -933,71 +920,10 @@ print(f"TEST: R²={r2_score(y_test_inv_eval, y_test_pred_eval):.4f}, "
 
 
 # =====================================================================
-# PHASE 7: OPTIONAL RETRAIN ON TRAIN+VAL (with pre-trained weights)
-# =====================================================================
-if DO_OPTIONAL_RETRAIN:
-    print("\n" + "=" * 70)
-    print("PHASE 7: OPTIONAL RETRAIN (clean: refit scalers on TRAIN+VAL)")
-    print("=" * 70)
-
-    X_trainval_orig = np.vstack([X_train_orig, X_val_orig])
-    y_trainval_orig = np.vstack([y_train_orig, y_val_orig])
-
-    scaler_X_tv = StandardScaler().fit(X_trainval_orig)
-    scaler_y_tv = StandardScaler().fit(y_trainval_orig)
-
-    X_trainval_tv = scaler_X_tv.transform(X_trainval_orig)
-    y_trainval_tv = scaler_y_tv.transform(y_trainval_orig)
-
-    X_test_tv = scaler_X_tv.transform(X_test_orig)
-    y_test_tv = scaler_y_tv.transform(y_test_orig)
-
-    tf.keras.backend.clear_session()
-    model_retrain = build_model_fixed(best_hp)
-
-    # Apply pre-trained weights before retraining
-    if _pretrain_available:
-        print("Initialising retrain model with pre-trained weights...")
-        n_tx = transfer_weights(warmup_model, model_retrain, verbose=True)
-        print(f"✓ Transferred {n_tx} layers to retrain model\n")
-    else:
-        print("Retraining from random initialisation\n")
-
-    model_retrain.fit(
-        X_trainval_tv, y_trainval_tv,
-        epochs=best_epoch,
-        batch_size=32,
-        verbose=1
-    )
-
-    y_test_pred_rt = scaler_y_tv.inverse_transform(
-        model_retrain.predict(X_test_tv, verbose=0)
-    ).reshape(-1)
-    y_test_inv_rt = y_test_orig.reshape(-1)
-
-    print(f"TEST (retrained): "
-          f"R²={r2_score(y_test_inv_rt, y_test_pred_rt):.4f}, "
-          f"RMSE={np.sqrt(mean_squared_error(y_test_inv_rt, y_test_pred_rt)):.4f}, "
-          f"MAE={np.mean(np.abs(y_test_inv_rt - y_test_pred_rt)):.4f}")
-
-    # Use retrained artifacts for exports/predictions
-    model = model_retrain
-    scaler_X = scaler_X_tv
-    scaler_y = scaler_y_tv
-    X_train = scaler_X.transform(X_train_orig)
-    X_val   = scaler_X.transform(X_val_orig)
-    X_test  = scaler_X.transform(X_test_orig)
-    y_train = scaler_y.transform(y_train_orig)
-    y_val   = scaler_y.transform(y_val_orig)
-    y_test  = scaler_y.transform(y_test_orig)
-    print("Using retrained model + train+val-fitted scalers for exports/predictions.")
-
-
-# =====================================================================
-# PHASE 8: EVALUATION, METRICS, EXPORTS
+# PHASE 7: EVALUATION, METRICS, EXPORTS
 # =====================================================================
 print("\n" + "=" * 70)
-print("PHASE 8: EVALUATION & EXPORTS")
+print("PHASE 7: EVALUATION & EXPORTS")
 print("=" * 70)
 
 # --- Print & save final Dense architecture ---
@@ -1057,39 +983,29 @@ print(f"Model and scalers saved to {EXPORT_DIR}/")
 
 # --- Predictions (inverse scaled) ---
 y_train_pred = scaler_y.inverse_transform(model.predict(X_train, verbose=0))
-y_val_pred   = scaler_y.inverse_transform(model.predict(X_val,   verbose=0))
 y_test_pred  = scaler_y.inverse_transform(model.predict(X_test,  verbose=0))
 
 y_train_inv = scaler_y.inverse_transform(y_train)
-y_val_inv   = scaler_y.inverse_transform(y_val)
 y_test_inv  = scaler_y.inverse_transform(y_test)
 
 # --- Metrics ---
 metrics_train = compute_basic_metrics(y_train_inv, y_train_pred)
-metrics_val   = compute_basic_metrics(y_val_inv,   y_val_pred)
 metrics_test  = compute_basic_metrics(y_test_inv,  y_test_pred)
 
 p = X_train.shape[1]
 n_in  = metrics_train["n"]
-n_val = metrics_val["n"]
 n_out = metrics_test["n"]
 r2_in  = metrics_train["R2"]
-r2_val = metrics_val["R2"]
 r2_out = metrics_test["R2"]
 r2_adj_in  = 1 - (1 - r2_in)  * (n_in  - 1) / (n_in  - p - 1) if (n_in  - p - 1) > 0 else np.nan
-r2_adj_val = 1 - (1 - r2_val) * (n_val - 1) / (n_val - p - 1) if (n_val - p - 1) > 0 else np.nan
 r2_adj_out = 1 - (1 - r2_out) * (n_out - 1) / (n_out - p - 1) if (n_out - p - 1) > 0 else np.nan
 
 metrics_train.update({"R2_adj": r2_adj_in,  "Predicted_R2_Q2": pred_R2_train})
-metrics_val.update(  {"R2_adj": r2_adj_val, "Predicted_R2_Q2": np.nan})
 metrics_test.update( {"R2_adj": r2_adj_out, "Predicted_R2_Q2": np.nan})
 
 print("\n=== Final Metrics ===")
 print(f"Training set ({TRAIN_PERCENT}%):")
 for k, v in metrics_train.items():
-    print(f"  {k}: {v}")
-print(f"Validation set ({VAL_PERCENT}%):")
-for k, v in metrics_val.items():
     print(f"  {k}: {v}")
 print(f"Test set ({TEST_PERCENT}%):")
 for k, v in metrics_test.items():
@@ -1103,7 +1019,7 @@ try:
         f.write("========================\n\n")
         f.write(f"Current date: {_dt.date.today().isoformat()}\n")
         f.write(f"Number of predictors (p): {p}\n")
-        f.write(f"Data split: {TRAIN_PERCENT}% train / {VAL_PERCENT}% validation / {TEST_PERCENT}% test\n")
+        f.write(f"Data split: {TRAIN_PERCENT}% train / {TEST_PERCENT}% test\n")
         f.write(f"Hill pre-training: V_max={HILL_V_MAX}, K={HILL_K}, n={HILL_N}, "
                 f"epochs={PRETRAIN_EPOCHS}, samples={N_SYNTHETIC}\n")
         f.write(f"Pre-trained weight transfer: {'YES' if _pretrain_available else 'NO'}\n\n")
@@ -1113,16 +1029,12 @@ try:
         f.write(f"\nTraining set metrics ({TRAIN_PERCENT}%):\n")
         for k, v in metrics_train.items():
             f.write(f"  {k}: {v}\n")
-        f.write(f"\nValidation set metrics ({VAL_PERCENT}%):\n")
-        for k, v in metrics_val.items():
-            f.write(f"  {k}: {v}\n")
         f.write(f"\nTest set metrics ({TEST_PERCENT}%):\n")
         for k, v in metrics_test.items():
             f.write(f"  {k}: {v}\n")
         f.write(f"\nPredicted R2 (Q2) on training (OOF aggregated, no leakage): {pred_R2_train}\n")
-        f.write(f"Best epoch selected on VAL loss: {best_epoch}\n")
-        f.write(f"Optional retrain on train+val: {DO_OPTIONAL_RETRAIN}\n")
-        f.write(f"PI calibration source: {PI_CALIBRATION}, alpha={PI_ALPHA}\n")
+        f.write(f"Best epoch (median from CV folds): {best_epoch}\n")
+        f.write(f"PI calibration source: OOF, alpha={PI_ALPHA}\n")
         f.write(f"\nK-Fold CV Summary ({K_FOLDS} folds):\n")
         f.write(f"  R²:   {r2_mean:.4f} ± {np.std(r2_scores):.4f}  "
                 f"[95% CI: {r2_ci_lo:.4f}, {r2_ci_hi:.4f}]\n")
@@ -1144,13 +1056,10 @@ try:
     if 'history' in globals() and hasattr(history, "history"):
         hist = history.history
         loss = hist.get('loss', None)
-        val_loss = hist.get('val_loss', None)
         if loss is not None:
             epochs_range = range(1, len(loss) + 1)
             plt.figure(figsize=(8, 5))
             plt.plot(epochs_range, loss, label='Train MSE (loss)', marker='o')
-            if val_loss is not None:
-                plt.plot(epochs_range, val_loss, label='Validation MSE (val_loss)', marker='o')
             plt.xlabel('Epoch')
             plt.ylabel('MSE (loss)')
             plt.title('Evolution of MSE during final training')
@@ -1255,13 +1164,6 @@ try:
     plot_residuals_raw_and_timeseries(y_train_inv, y_train_pred, "Train",
                                      save_prefix=os.path.join(plots_dir, "train_raw"))
 
-    plot_predicted_vs_actual(y_val_inv, y_val_pred, "Predicted vs Actual (Validation)",
-                            save_path=os.path.join(plots_dir, "pred_vs_actual_val.png"))
-    plot_residuals_std_and_timeseries(y_val_inv, y_val_pred, "Validation",
-                                     save_prefix=os.path.join(plots_dir, "val_std"))
-    plot_residuals_raw_and_timeseries(y_val_inv, y_val_pred, "Validation",
-                                     save_prefix=os.path.join(plots_dir, "val_raw"))
-
     plot_predicted_vs_actual(y_test_inv, y_test_pred, "Predicted vs Actual (Test)",
                             save_path=os.path.join(plots_dir, "pred_vs_actual_test.png"))
     plot_residuals_std_and_timeseries(y_test_inv, y_test_pred, "Test",
@@ -1294,55 +1196,42 @@ def make_export_df(labels_df_part, inputs_df_part, y_true, y_pred):
     return df_export
 
 results_train = make_export_df(labels_train.reset_index(drop=True), X_train_df, y_train_inv, y_train_pred)
-results_val   = make_export_df(labels_val.reset_index(drop=True),   X_val_df,   y_val_inv,   y_val_pred)
 results_test  = make_export_df(labels_test.reset_index(drop=True),  X_test_df,  y_test_inv,  y_test_pred)
 
 # --- Save standard exports ---
 train_path = os.path.join(EXPORT_DIR, "train_predictions.xlsx")
-val_path   = os.path.join(EXPORT_DIR, "val_predictions.xlsx")
 test_path  = os.path.join(EXPORT_DIR, "test_predictions.xlsx")
 results_train.to_excel(train_path, index=False, engine='openpyxl')
-results_val.to_excel(val_path, index=False, engine='openpyxl')
 results_test.to_excel(test_path, index=False, engine='openpyxl')
 results_train.to_csv(os.path.join(EXPORT_DIR, "train_predictions.csv"), index=False)
-results_val.to_csv(os.path.join(EXPORT_DIR, "val_predictions.csv"), index=False)
 results_test.to_csv(os.path.join(EXPORT_DIR, "test_predictions.csv"), index=False)
-print(f"Results exported to {train_path}, {val_path}, {test_path} and CSV equivalents")
+print(f"Results exported to {train_path}, {test_path} and CSV equivalents")
 
 # --- Create full-row exports ---
 try:
     train_full_rows = df.iloc[idx_train].reset_index(drop=True)
-    val_full_rows   = df.iloc[idx_val].reset_index(drop=True)
     test_full_rows  = df.iloc[idx_test].reset_index(drop=True)
 
     y_train_pred_flat = np.array(y_train_pred).reshape(-1)
-    y_val_pred_flat   = np.array(y_val_pred).reshape(-1)
     y_test_pred_flat  = np.array(y_test_pred).reshape(-1)
     y_train_inv_flat  = np.array(y_train_inv).reshape(-1)
-    y_val_inv_flat    = np.array(y_val_inv).reshape(-1)
     y_test_inv_flat   = np.array(y_test_inv).reshape(-1)
 
     residuals_train = y_train_inv_flat - y_train_pred_flat
-    residuals_val   = y_val_inv_flat   - y_val_pred_flat
     residuals_test  = y_test_inv_flat  - y_test_pred_flat
     abs_err_train = np.abs(residuals_train)
-    abs_err_val   = np.abs(residuals_val)
     abs_err_test  = np.abs(residuals_test)
     with np.errstate(divide='ignore', invalid='ignore'):
         abs_pct_train = np.where(np.abs(y_train_inv_flat) > 1e-12,
                                  100.0 * abs_err_train / np.abs(y_train_inv_flat), np.nan)
-        abs_pct_val   = np.where(np.abs(y_val_inv_flat) > 1e-12,
-                                 100.0 * abs_err_val / np.abs(y_val_inv_flat), np.nan)
         abs_pct_test  = np.where(np.abs(y_test_inv_flat) > 1e-12,
                                  100.0 * abs_err_test / np.abs(y_test_inv_flat), np.nan)
 
     train_full_rows = train_full_rows.copy()
-    val_full_rows   = val_full_rows.copy()
     test_full_rows  = test_full_rows.copy()
 
     for fr, actual, pred, res, aerr, apct in [
         (train_full_rows, y_train_inv_flat, y_train_pred_flat, residuals_train, abs_err_train, abs_pct_train),
-        (val_full_rows,   y_val_inv_flat,   y_val_pred_flat,   residuals_val,   abs_err_val,   abs_pct_val),
         (test_full_rows,  y_test_inv_flat,  y_test_pred_flat,  residuals_test,  abs_err_test,  abs_pct_test),
     ]:
         fr["Actual_Value"]      = actual
@@ -1358,10 +1247,9 @@ try:
         return df_full[cols]
 
     train_full_rows = move_pred_cols_to_end(train_full_rows)
-    val_full_rows   = move_pred_cols_to_end(val_full_rows)
     test_full_rows  = move_pred_cols_to_end(test_full_rows)
 
-    for name, fr in [("train", train_full_rows), ("val", val_full_rows), ("test", test_full_rows)]:
+    for name, fr in [("train", train_full_rows), ("test", test_full_rows)]:
         fr.to_excel(os.path.join(EXPORT_DIR, f"{name}_full_with_all_columns.xlsx"),
                     index=False, engine='openpyxl')
         fr.to_csv(os.path.join(EXPORT_DIR, f"{name}_full_with_all_columns.csv"), index=False)
@@ -1371,7 +1259,6 @@ except Exception as e:
     traceback.print_exc()
 
 _show(results_train.head())
-_show(results_val.head())
 _show(results_test.head())
 
 print("\n" + "=" * 80)
@@ -1381,10 +1268,10 @@ print("=" * 80)
 
 
 # =====================================================================
-# PHASE 9: 3D SURFACE PLOTS
+# PHASE 8: 3D SURFACE PLOTS
 # =====================================================================
 print("\n" + "=" * 70)
-print("PHASE 9: 3D SURFACE PLOTS")
+print("PHASE 8: 3D SURFACE PLOTS")
 print("=" * 70)
 
 from itertools import combinations
@@ -1588,16 +1475,12 @@ print("Creating ZIP archive of training files...")
 
 training_files = [
     os.path.join(EXPORT_DIR, "train_predictions.xlsx"),
-    os.path.join(EXPORT_DIR, "val_predictions.xlsx"),
     os.path.join(EXPORT_DIR, "test_predictions.xlsx"),
     os.path.join(EXPORT_DIR, "train_full_with_all_columns.xlsx"),
-    os.path.join(EXPORT_DIR, "val_full_with_all_columns.xlsx"),
     os.path.join(EXPORT_DIR, "test_full_with_all_columns.xlsx"),
     os.path.join(EXPORT_DIR, "train_predictions.csv"),
-    os.path.join(EXPORT_DIR, "val_predictions.csv"),
     os.path.join(EXPORT_DIR, "test_predictions.csv"),
     os.path.join(EXPORT_DIR, "train_full_with_all_columns.csv"),
-    os.path.join(EXPORT_DIR, "val_full_with_all_columns.csv"),
     os.path.join(EXPORT_DIR, "test_full_with_all_columns.csv"),
     os.path.join(EXPORT_DIR, "model_statistics.txt"),
     os.path.join(EXPORT_DIR, "model_scheme.txt"),
@@ -1661,26 +1544,17 @@ print("\n" + "=" * 80 + "\n")
 
 
 # =====================================================================
-# PHASE 10: NEW DATA PREDICTIONS
+# PHASE 9: NEW DATA PREDICTIONS
 # =====================================================================
 print("=" * 80)
-print("PHASE 10: NEW DATA PREDICTIONS")
+print("PHASE 9: NEW DATA PREDICTIONS")
 print("=" * 80)
 
-# --- Empirical prediction interval calibration ---
-def get_calibration_residuals(source="val"):
-    source = str(source).strip().lower()
-    if source == "val":
-        return y_val_inv.reshape(-1) - y_val_pred.reshape(-1)
-    elif source == "oof":
-        return y_oof_true_inv.reshape(-1) - y_oof_pred_inv.reshape(-1)
-    else:
-        raise ValueError("PI_CALIBRATION must be 'val' or 'oof'")
-
-cal_residuals = get_calibration_residuals(PI_CALIBRATION)
+# --- Empirical prediction interval calibration (using OOF residuals) ---
+cal_residuals = y_oof_true_inv.reshape(-1) - y_oof_pred_inv.reshape(-1)
 q_low = np.quantile(cal_residuals, PI_ALPHA / 2.0)
 q_high = np.quantile(cal_residuals, 1.0 - PI_ALPHA / 2.0)
-print(f"Empirical PI calibration ({PI_CALIBRATION}): "
+print(f"Empirical PI calibration (OOF): "
       f"q_low={q_low:.4f}, q_high={q_high:.4f} (alpha={PI_ALPHA})")
 
 print("\n📂 Upload new data for predictions (optional).")
@@ -1766,7 +1640,7 @@ if new_data_loaded and new_df is not None:
         new_results_compact["PI_Lower_95%"] = pi_lower
         new_results_compact["PI_Upper_95%"] = pi_upper
         new_results_compact["PI_Width"] = pi_upper - pi_lower
-        new_results_compact["PI_Calibration_Source"] = PI_CALIBRATION
+        new_results_compact["PI_Calibration_Source"] = "oof"
 
         new_has_actual = False
         if n_cols_new > N_LABELS + N_INPUTS:
@@ -1816,7 +1690,7 @@ if new_data_loaded and new_df is not None:
         new_full_rows["PI_Lower_95%"] = pi_lower
         new_full_rows["PI_Upper_95%"] = pi_upper
         new_full_rows["PI_Width"] = pi_upper - pi_lower
-        new_full_rows["PI_Calibration_Source"] = PI_CALIBRATION
+        new_full_rows["PI_Calibration_Source"] = "oof"
         if new_has_actual:
             new_full_rows["Actual_Value"] = new_y_actual_flat
             new_full_rows["Prediction_Error"] = residual
