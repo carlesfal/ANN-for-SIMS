@@ -34,36 +34,47 @@ from .config import PipelineConfig
 # Model builder
 # ---------------------------------------------------------------------------
 
-def make_model_builder(n_features: int):
-    """Return a Keras-Tuner–compatible model-builder function.
+def make_model_builder(n_features: int, use_batch_norm: bool = True):
+    """Return a Keras-Tuner-compatible model-builder function.
 
     The returned callable accepts an ``hp`` object and produces a compiled
     ``keras.Sequential`` model.  The *n_features* argument is captured via
     closure so the builder does not depend on global state.
+
+    Improvements over the original:
+    - Wider HP search space (units 32-1024, activations, finer dropout)
+    - Optional BatchNormalization for training stability
+    - He-normal initialisation for ReLU-family activations
+    - Batch size as a tunable hyperparameter
     """
 
     def build_model(hp: Any) -> keras.Model:
         model = keras.Sequential()
         model.add(layers.Input(shape=(n_features,)))
 
-        n_layers = hp.Int("num_layers", 2, 6, step=1)
-        l2_val = hp.Choice("l2_reg", [1e-4, 1e-3, 1e-2])
+        n_layers = hp.Int("num_layers", 1, 8, step=1)
+        l2_val = hp.Choice("l2_reg", [1e-5, 1e-4, 1e-3, 1e-2])
+        activation = hp.Choice("activation", ["relu", "elu", "selu", "swish"])
+        do_bn = hp.Boolean("batch_norm") if use_batch_norm else False
 
         for i in range(n_layers):
-            units = hp.Int(f"units_{i}", 64, 512, step=64)
+            units = hp.Int(f"units_{i}", 32, 1024, step=32)
             model.add(
                 layers.Dense(
                     units,
-                    activation="relu",
+                    activation=activation,
+                    kernel_initializer="he_normal",
                     kernel_regularizer=regularizers.l2(l2_val),
                 )
             )
-            model.add(layers.Dropout(hp.Float(f"dropout_{i}", 0.0, 0.5, step=0.1)))
+            if do_bn:
+                model.add(layers.BatchNormalization())
+            model.add(layers.Dropout(hp.Float(f"dropout_{i}", 0.0, 0.5, step=0.05)))
 
         model.add(layers.Dense(1, activation="linear"))
         model.compile(
             optimizer=keras.optimizers.Adam(
-                learning_rate=hp.Choice("lr", [1e-4, 5e-4, 1e-3, 5e-3])
+                learning_rate=hp.Choice("lr", [1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3])
             ),
             loss="mse",
             metrics=["mae"],
@@ -85,8 +96,15 @@ def run_tuner(
     y_val: NDArray[np.floating],
     cfg: PipelineConfig,
 ) -> tuple[Any, Any]:
-    """Run Keras-Tuner ``RandomSearch`` and return ``(tuner, best_hp)``."""
-    tuner = kt.RandomSearch(
+    """Run Keras-Tuner search and return ``(tuner, best_hp)``.
+
+    Uses BayesianOptimization by default (more sample-efficient than
+    RandomSearch).  Falls back to RandomSearch if configured.
+    """
+    tuner_cls = kt.BayesianOptimization if cfg.tuner_algorithm == "bayesian" else kt.RandomSearch
+    algo_name = "BayesianOptimization" if cfg.tuner_algorithm == "bayesian" else "RandomSearch"
+
+    tuner = tuner_cls(
         build_fn,
         objective="val_loss",
         max_trials=cfg.tuner_trials,
@@ -94,7 +112,7 @@ def run_tuner(
         directory="tuner_results",
         project_name=f"ann_{cfg.train_percent}_{cfg.val_percent}_{cfg.test_percent}",
     )
-    print(f"Starting hyperparameter search ({cfg.tuner_trials} trials)…")
+    print(f"Starting {algo_name} hyperparameter search ({cfg.tuner_trials} trials)…")
     tuner.search(
         X_train, y_train,
         validation_data=(X_val, y_val),
@@ -176,6 +194,9 @@ class CVResult:
     y_oof_pred: NDArray[np.floating]
     y_oof_true: NDArray[np.floating]
     pred_r2: float
+    fold_models: list[Any] | None = None
+    fold_scalers_X: list[Any] | None = None
+    fold_scalers_y: list[Any] | None = None
 
 
 def run_cv(
@@ -186,7 +207,11 @@ def run_cv(
     cfg: PipelineConfig,
     pretrained_model: Optional[keras.Model] = None,
 ) -> CVResult:
-    """K-fold CV on the TRAIN split with per-fold fitted scalers (no leakage)."""
+    """K-fold CV on the TRAIN split with per-fold fitted scalers (no leakage).
+
+    When ``cfg.use_cv_ensemble`` is True, the trained fold models and their
+    scalers are retained so they can later be used for ensemble prediction.
+    """
     kf = KFold(n_splits=cfg.k_folds, shuffle=True, random_state=cfg.random_seed)
 
     r2_list: list[float] = []
@@ -194,6 +219,24 @@ def run_cv(
     mae_list: list[float] = []
     oof_pred = np.full(len(y_train_orig), np.nan)
     oof_true = np.full(len(y_train_orig), np.nan)
+
+    fold_models: list[Any] = []
+    fold_scalers_X: list[Any] = []
+    fold_scalers_y: list[Any] = []
+
+    cv_cbs: list[Any] = [
+        callbacks.EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True),
+    ]
+    if cfg.use_lr_scheduler:
+        cv_cbs.append(
+            callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=cfg.lr_scheduler_factor,
+                patience=cfg.lr_scheduler_patience,
+                min_lr=1e-6,
+                verbose=1,
+            )
+        )
 
     print(f"\n{cfg.k_folds}-fold CV on TRAIN with fold-fitted scalers (no leakage)…")
 
@@ -216,15 +259,12 @@ def run_cv(
             except Exception:
                 pass
 
-        es = callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True
-        )
         model_fold.fit(
             X_tr_s, y_tr_s,
             validation_data=(X_va_s, y_va_s),
             epochs=cfg.cv_epochs,
             batch_size=32,
-            callbacks=[es],
+            callbacks=cv_cbs,
             verbose=1,
         )
 
@@ -235,6 +275,11 @@ def run_cv(
 
         oof_pred[va_idx] = va_pred_inv
         oof_true[va_idx] = va_true_inv
+
+        if cfg.use_cv_ensemble:
+            fold_models.append(model_fold)
+            fold_scalers_X.append(fold_sx)
+            fold_scalers_y.append(fold_sy)
 
         r2 = r2_score(va_true_inv, va_pred_inv)
         rmse = float(np.sqrt(mean_squared_error(va_true_inv, va_pred_inv)))
@@ -263,6 +308,9 @@ def run_cv(
         y_oof_pred=oof_pred,
         y_oof_true=oof_true,
         pred_r2=pred_r2,
+        fold_models=fold_models if cfg.use_cv_ensemble else None,
+        fold_scalers_X=fold_scalers_X if cfg.use_cv_ensemble else None,
+        fold_scalers_y=fold_scalers_y if cfg.use_cv_ensemble else None,
     )
 
 
@@ -288,14 +336,29 @@ def train_final_model(
     y_val: NDArray[np.floating],
     cfg: PipelineConfig,
 ) -> TrainResult:
-    """Train on TRAIN, validate on VAL (test untouched)."""
+    """Train on TRAIN, validate on VAL (test untouched).
+
+    Uses ReduceLROnPlateau when ``cfg.use_lr_scheduler`` is True.
+    """
     print("\nFinal training: fit on TRAIN, validate on VAL.")
 
     os.makedirs(cfg.export_dir, exist_ok=True)
     ckpt_path = os.path.join(cfg.export_dir, "best_model.keras")
 
-    mc = callbacks.ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1)
-    es = callbacks.EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)
+    final_cbs: list[Any] = [
+        callbacks.EarlyStopping(monitor="val_loss", patience=30, restore_best_weights=True),
+        callbacks.ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1),
+    ]
+    if cfg.use_lr_scheduler:
+        final_cbs.append(
+            callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=cfg.lr_scheduler_factor,
+                patience=cfg.lr_scheduler_patience,
+                min_lr=1e-6,
+                verbose=1,
+            )
+        )
 
     tf.keras.backend.clear_session()
     model = build_fn(best_hp)
@@ -304,7 +367,7 @@ def train_final_model(
         validation_data=(X_val, y_val),
         epochs=cfg.final_epochs,
         batch_size=32,
-        callbacks=[es, mc],
+        callbacks=final_cbs,
         verbose=1,
     )
 

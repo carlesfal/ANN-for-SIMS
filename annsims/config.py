@@ -29,15 +29,23 @@ class PipelineConfig:
     disable_gpu: bool = True
 
     # --- Tuning / training ---
-    tuner_trials: int = 15
+    tuner_trials: int = 30
+    tuner_algorithm: str = "bayesian"  # "bayesian" or "random"
     k_folds: int = 15
     random_seed: int = 42
-    tuner_epochs: int = 200
-    cv_epochs: int = 200
-    final_epochs: int = 200
+    tuner_epochs: int = 300
+    cv_epochs: int = 300
+    final_epochs: int = 500
+    use_batch_norm: bool = True
+    use_lr_scheduler: bool = True
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 8
 
     # --- Optional retrain on train+val ---
     do_optional_retrain: bool = True
+
+    # --- CV ensemble ---
+    use_cv_ensemble: bool = True
 
     # --- Prediction interval ---
     pi_calibration: str = "val"  # "val" or "oof"

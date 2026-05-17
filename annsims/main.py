@@ -111,7 +111,7 @@ def run_pipeline(
 
     # ---- Model builder (no global state) ----
     n_features = split.X_train_orig.shape[1]
-    build_fn = make_model_builder(n_features)
+    build_fn = make_model_builder(n_features, use_batch_norm=cfg.use_batch_norm)
 
     # ---- Hyperparameter search ----
     tuner, best_hp = run_tuner(
@@ -144,16 +144,34 @@ def run_pipeline(
     scaler_y = scaled.scaler_y
 
     # Evaluate once on TEST
+    from sklearn.metrics import r2_score, mean_squared_error
+
     print("\nEvaluating once on TEST.")
     y_test_pred_eval = scaler_y.inverse_transform(model.predict(scaled.X_test, verbose=0)).reshape(-1)
     y_test_inv_eval = scaler_y.inverse_transform(scaled.y_test).reshape(-1)
-    from sklearn.metrics import r2_score, mean_squared_error
-
     print(
         f"TEST: R²={r2_score(y_test_inv_eval, y_test_pred_eval):.4f}  "
         f"RMSE={np.sqrt(mean_squared_error(y_test_inv_eval, y_test_pred_eval)):.4f}  "
         f"MAE={np.mean(np.abs(y_test_inv_eval - y_test_pred_eval)):.4f}"
     )
+
+    # ---- CV fold ensemble evaluation (if enabled) ----
+    if cfg.use_cv_ensemble and cv.fold_models:
+        print("\nCV Ensemble evaluation on TEST:")
+        ensemble_preds = np.zeros(len(split.X_test_orig))
+        for fm, fsx, fsy in zip(cv.fold_models, cv.fold_scalers_X, cv.fold_scalers_y):
+            pred_i = fsy.inverse_transform(
+                fm.predict(fsx.transform(split.X_test_orig), verbose=0)
+            ).reshape(-1)
+            ensemble_preds += pred_i
+        ensemble_preds /= len(cv.fold_models)
+        y_test_true = split.y_test_orig.reshape(-1)
+        print(
+            f"TEST (ensemble of {len(cv.fold_models)} folds): "
+            f"R²={r2_score(y_test_true, ensemble_preds):.4f}  "
+            f"RMSE={np.sqrt(mean_squared_error(y_test_true, ensemble_preds)):.4f}  "
+            f"MAE={np.mean(np.abs(y_test_true - ensemble_preds)):.4f}"
+        )
 
     # ---- Optional retrain on train+val ----
     if cfg.do_optional_retrain:
