@@ -425,7 +425,22 @@ def phase3_transfer(
 # CLI entry-point
 # ---------------------------------------------------------------------------
 
-def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
+def _running_in_notebook() -> bool:
+    """Detect Jupyter / Colab kernel environments."""
+    try:
+        from IPython import get_ipython  # type: ignore[import-untyped]
+        shell = get_ipython()
+        if shell is None:
+            return False
+        return shell.__class__.__name__ in ("ZMQInteractiveShell", "Shell")
+    except ImportError:
+        return False
+
+
+def parse_args(argv: Optional[List[str]] = None) -> "tuple[PipelineConfig, str]":
+    if _running_in_notebook():
+        return PipelineConfig(), "saved_models"
+
     parser = argparse.ArgumentParser(
         description="Hill pre-train → tune → transfer pipeline"
     )
