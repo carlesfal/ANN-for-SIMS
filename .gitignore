@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ML artifacts
+tuner_results/
+saved_models/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
