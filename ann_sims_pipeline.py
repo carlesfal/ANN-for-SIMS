@@ -20,7 +20,12 @@
 #    Stage 3 (full):         unfreeze everything, very low LR.
 #    Every stage uses ReduceLROnPlateau for adaptive scheduling.
 #
-# 4. UNIFIED STANDARDISATION — Every array entering the model is z-scored;
+# 4. L-BFGS-B REFINEMENT — After each Adam training phase, the weights
+#    are polished with scipy's L-BFGS-B (Broyden-Fletcher-Goldfarb-Shanno)
+#    second-order optimizer.  BFGS approximates the inverse Hessian,
+#    converging to a tighter minimum than first-order Adam alone.
+#
+# 5. UNIFIED STANDARDISATION — Every array entering the model is z-scored;
 #    inverse-transform is applied only when producing human-readable outputs.
 # =============================================================================
 
@@ -59,6 +64,7 @@ from typing import Any, List, Optional
 import numpy as np
 import pandas as pd
 import joblib
+from scipy.optimize import minimize as scipy_minimize
 import matplotlib
 matplotlib.use("Agg") if not IN_NOTEBOOK else None
 import matplotlib.pyplot as plt
@@ -168,6 +174,10 @@ class PipelineConfig:
     # L2-SP strength during fine-tuning (0 = standard L2)
     l2sp_alpha: float = 1e-3
 
+    # L-BFGS-B refinement
+    lbfgs_maxiter: int = 200
+    lbfgs_enabled: bool = True
+
     pi_calibration: str = "val"
     pi_alpha: float = 0.05
 
@@ -211,6 +221,99 @@ if cfg.disable_gpu:
         print("GPU disabled. Using CPU.")
     except Exception as e:
         print(f"Could not change GPU visibility: {e}")
+
+
+# =============================================================================
+#  L-BFGS-B REFINEMENT (Broyden-Fletcher-Goldfarb-Shanno, bounded)
+# =============================================================================
+def lbfgs_refine(model, X_tr, y_tr, X_va=None, y_va=None,
+                 maxiter=200, verbose=True):
+    """Polish model weights with L-BFGS-B to minimise MSE.
+
+    Adam (first-order) is fast but noisy near the optimum.  L-BFGS-B uses
+    a limited-memory approximation of the inverse Hessian for second-order
+    convergence, squeezing out remaining prediction error.
+
+    Parameters
+    ----------
+    model : keras.Model   — model whose *trainable* weights are optimised.
+    X_tr, y_tr            — training arrays (standardised).
+    X_va, y_va            — optional validation arrays for monitoring.
+    maxiter               — maximum L-BFGS-B iterations.
+    verbose               — print before/after loss.
+    """
+    if not cfg.lbfgs_enabled:
+        return model
+
+    trainable_vars = model.trainable_variables
+    shapes = [v.shape.as_list() for v in trainable_vars]
+    sizes = [int(np.prod(s)) for s in shapes]
+    n_params = sum(sizes)
+
+    X_tensor = tf.constant(X_tr, dtype=tf.float32)
+    y_tensor = tf.constant(y_tr, dtype=tf.float32)
+
+    loss_before = float(tf.reduce_mean(tf.square(
+        model(X_tensor, training=False) - y_tensor)).numpy())
+
+    def _unflatten(flat):
+        tensors, offset = [], 0
+        for shape, sz in zip(shapes, sizes):
+            tensors.append(tf.constant(
+                flat[offset:offset+sz].reshape(shape), dtype=tf.float32))
+            offset += sz
+        return tensors
+
+    @tf.function
+    def _loss_and_grad(weight_tensors):
+        for var, val in zip(trainable_vars, weight_tensors):
+            var.assign(val)
+        with tf.GradientTape() as tape:
+            pred = model(X_tensor, training=False)
+            loss = tf.reduce_mean(tf.square(pred - y_tensor))
+        grads = tape.gradient(loss, trainable_vars)
+        return loss, grads
+
+    call_count = [0]
+
+    def func(flat_weights):
+        wt = _unflatten(flat_weights)
+        loss, grads = _loss_and_grad(wt)
+        flat_grad = np.concatenate([g.numpy().ravel() for g in grads])
+        call_count[0] += 1
+        return float(loss.numpy()), flat_grad.astype(np.float64)
+
+    w0 = np.concatenate([v.numpy().ravel() for v in trainable_vars])
+
+    result = scipy_minimize(
+        func, w0.astype(np.float64), method="L-BFGS-B", jac=True,
+        options={"maxiter": maxiter, "ftol": 1e-12, "gtol": 1e-8,
+                 "disp": False},
+    )
+
+    # Set optimised weights back
+    opt_tensors = _unflatten(result.x)
+    for var, val in zip(trainable_vars, opt_tensors):
+        var.assign(val)
+
+    loss_after = float(tf.reduce_mean(tf.square(
+        model(X_tensor, training=False) - y_tensor)).numpy())
+
+    if verbose:
+        tag = "L-BFGS-B"
+        msg = (f"  [{tag}] {result.nit} iters, {call_count[0]} f-evals | "
+               f"MSE {loss_before:.6f} -> {loss_after:.6f}")
+        if X_va is not None and y_va is not None:
+            val_pred = model.predict(X_va, verbose=0)
+            val_mse = float(np.mean((val_pred - y_va) ** 2))
+            msg += f" | val_MSE={val_mse:.6f}"
+        if result.success:
+            msg += " [converged]"
+        else:
+            msg += f" [{result.message}]"
+        print(msg)
+
+    return model
 
 
 # =============================================================================
@@ -348,8 +451,13 @@ warmup_model.fit(
 )
 
 warmup_val = warmup_model.evaluate(X_h_val, y_h_val, verbose=0)
-print(f"\nWarmup model converged.  val_loss={warmup_val[0]:.6f}  "
+print(f"\nWarmup model (Adam).  val_loss={warmup_val[0]:.6f}  "
       f"val_mae={warmup_val[1]:.6f}")
+
+print("Refining warmup with L-BFGS-B...")
+warmup_model = lbfgs_refine(warmup_model, X_h_train, y_h_train,
+                             X_va=X_h_val, y_va=y_h_val,
+                             maxiter=cfg.lbfgs_maxiter)
 
 # Snapshot pre-trained weights (needed for L2-SP)
 pretrained_weights = {}
@@ -583,7 +691,12 @@ model_ft.fit(
     ],
     verbose=1,
 )
-_eval_model(model_ft, X_val, y_val, "after Stage 1")
+_eval_model(model_ft, X_val, y_val, "after Stage 1 (Adam)")
+print("Refining Stage 1 with L-BFGS-B...")
+model_ft = lbfgs_refine(model_ft, X_train, y_train,
+                         X_va=X_val, y_va=y_val,
+                         maxiter=cfg.lbfgs_maxiter)
+_eval_model(model_ft, X_val, y_val, "after Stage 1 (L-BFGS-B)")
 
 # --- Stage 2: Unfreeze last N Dense layers ------------------------------------
 n_unfreeze = cfg.ft_stage2_unfreeze_last_n
@@ -614,7 +727,12 @@ model_ft.fit(
     ],
     verbose=1,
 )
-_eval_model(model_ft, X_val, y_val, "after Stage 2")
+_eval_model(model_ft, X_val, y_val, "after Stage 2 (Adam)")
+print("Refining Stage 2 with L-BFGS-B...")
+model_ft = lbfgs_refine(model_ft, X_train, y_train,
+                         X_va=X_val, y_va=y_val,
+                         maxiter=cfg.lbfgs_maxiter)
+_eval_model(model_ft, X_val, y_val, "after Stage 2 (L-BFGS-B)")
 
 # --- Stage 3: Unfreeze everything, ReduceLROnPlateau, very low LR ------------
 print(f"\n--- Stage 3: full unfreeze ({cfg.ft_stage3_epochs} epochs, "
@@ -637,7 +755,12 @@ model_ft.fit(
     ],
     verbose=1,
 )
-_eval_model(model_ft, X_val, y_val, "after Stage 3 (final)")
+_eval_model(model_ft, X_val, y_val, "after Stage 3 (Adam)")
+print("Refining Stage 3 with L-BFGS-B...")
+model_ft = lbfgs_refine(model_ft, X_train, y_train,
+                         X_va=X_val, y_va=y_val,
+                         maxiter=cfg.lbfgs_maxiter)
+_eval_model(model_ft, X_val, y_val, "after Stage 3 (L-BFGS-B, final)")
 
 # The fine-tuned model becomes the pretrained initialiser for CV + final
 _pretrained_model = model_ft
@@ -685,6 +808,9 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
         ],
         verbose=1,
     )
+    model_fold = lbfgs_refine(model_fold, X_tr_s, y_tr_s,
+                               X_va=X_va_s, y_va=y_va_s,
+                               maxiter=cfg.lbfgs_maxiter, verbose=False)
 
     va_pred = fold_sy.inverse_transform(
         model_fold.predict(X_va_s, verbose=0)
@@ -751,6 +877,12 @@ if os.path.exists(ckpt_path):
 best_epoch = int(np.argmin(history.history["val_loss"]) + 1)
 print(f"Best epoch (VAL loss): {best_epoch}")
 
+print("Refining final model with L-BFGS-B...")
+model.compile(loss="mse", metrics=["mae"])
+model = lbfgs_refine(model, X_train, y_train,
+                      X_va=X_val, y_va=y_val,
+                      maxiter=cfg.lbfgs_maxiter)
+
 # Evaluate on TEST
 y_test_pred_eval = scaler_y.inverse_transform(
     model.predict(X_test, verbose=0)).reshape(-1)
@@ -777,13 +909,18 @@ if cfg.do_optional_retrain:
         model_rt.set_weights(_pretrained_model_weights)
     except Exception:
         pass
+    X_tv_s = scaler_X_tv.transform(X_tv)
+    y_tv_s = scaler_y_tv.transform(y_tv)
     model_rt.fit(
-        scaler_X_tv.transform(X_tv), scaler_y_tv.transform(y_tv),
+        X_tv_s, y_tv_s,
         epochs=best_epoch, batch_size=32,
         callbacks=[callbacks.ReduceLROnPlateau(
             monitor="loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1)],
         verbose=1,
     )
+    print("Refining retrained model with L-BFGS-B...")
+    model_rt = lbfgs_refine(model_rt, X_tv_s, y_tv_s,
+                             maxiter=cfg.lbfgs_maxiter)
 
     y_pred_rt = scaler_y_tv.inverse_transform(
         model_rt.predict(scaler_X_tv.transform(X_test_orig), verbose=0)
@@ -915,6 +1052,8 @@ try:
         for kk, vv in best_hp.values.items():
             fh.write(f"  {kk}: {vv}\n")
         fh.write(f"\nL2-SP alpha: {cfg.l2sp_alpha}\n")
+        fh.write(f"L-BFGS-B enabled: {cfg.lbfgs_enabled}  "
+                 f"maxiter: {cfg.lbfgs_maxiter}\n")
         fh.write(f"Layers transferred: {n_transferred}\n")
         fh.write(f"Fine-tune stages: "
                  f"S1({cfg.ft_stage1_epochs}ep,LR={cfg.ft_stage1_lr}) "
