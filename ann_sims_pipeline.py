@@ -113,8 +113,9 @@ class L2SP(keras.regularizers.Regularizer):
 
     def __call__(self, w):
         if self.w0 is not None:
-            ref = tf.constant(self.w0, dtype=w.dtype)
-            return self.alpha * tf.reduce_sum(tf.square(w - ref))
+            if list(self.w0.shape) == w.shape.as_list():
+                ref = tf.constant(self.w0, dtype=w.dtype)
+                return self.alpha * tf.reduce_sum(tf.square(w - ref))
         return self.alpha * tf.reduce_sum(tf.square(w))
 
     def get_config(self):
@@ -843,11 +844,18 @@ def run_three_stage_finetune(model, d, pretrained_weights):
     n_transferred = 0
     for layer in model.layers:
         if layer.name in pretrained_weights:
-            try:
-                layer.set_weights(pretrained_weights[layer.name])
-                n_transferred += 1
-            except Exception as e:
-                print(f"  Could not transfer {layer.name}: {e}")
+            src = pretrained_weights[layer.name]
+            dst_shapes = [w.shape for w in layer.get_weights()]
+            src_shapes = [w.shape for w in src]
+            if dst_shapes == src_shapes:
+                try:
+                    layer.set_weights(src)
+                    n_transferred += 1
+                except Exception as e:
+                    print(f"  Could not transfer {layer.name}: {e}")
+            else:
+                print(f"  Skipping {layer.name}: shape mismatch "
+                      f"{src_shapes} vs {dst_shapes}")
     print(f"Transferred weights for {n_transferred} layer(s).")
     _eval_model(model, d["X_val"], d["y_val"], "after transfer, before fine-tune")
 
