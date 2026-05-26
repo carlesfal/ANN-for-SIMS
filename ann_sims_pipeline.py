@@ -1,20 +1,26 @@
 # =============================================================================
-# Two-Dataset Pipeline: Pre-Train on Dataset 1 -> Fine-Tune on Dataset 2
+# Three-Phase Pipeline:
+#   Hill Warmup -> Phase A (Dataset 1) -> Phase B (Dataset 2)
 #
 # DESIGN:
 #
-# PHASE A — FULL TRAINING ON DATASET 1 (pre-training data)
-#   Upload Dataset 1 (n_labels + n_inputs + target).
-#   Tune dropout/L2/LR, K-fold CV, final training + L-BFGS-B refinement.
-#   Full diagnostics, metrics, plots, exports.
-#   Snapshot pre-trained weights for transfer.
+# HILL WARMUP — Synthetic Hill-function pre-training.
+#   Generates synthetic data, tunes dropout/L2/LR, trains warmup model.
+#   Snapshots weights for transfer into Phase A.
 #
-# PHASE B — FINE-TUNE ON DATASET 2 (same n_labels, n_inputs)
-#   Upload Dataset 2 (same column layout).
-#   L2-SP regularisation toward Dataset-1 weights.
-#   Three-stage progressive unfreezing (output-only -> last-N -> full).
-#   K-fold CV, final training + L-BFGS-B.
-#   Full diagnostics, metrics, plots, exports.
+# PHASE A — FULL TRAINING ON DATASET 1
+#   Upload Dataset 1 (n_labels_a + n_inputs_a + target).
+#   Weight transfer from Hill warmup.
+#   L2-SP regularisation toward warmup weights.
+#   Three-stage progressive unfreezing + L-BFGS-B.
+#   K-fold CV, final training, diagnostics.
+#
+# PHASE B — FINE-TUNE ON DATASET 2 (can differ in n_labels/n_inputs)
+#   Upload Dataset 2 (n_labels_b + n_inputs_b + target).
+#   Weight transfer from Phase A model.
+#   L2-SP regularisation toward Phase A weights.
+#   Three-stage progressive unfreezing + L-BFGS-B.
+#   K-fold CV, final training, diagnostics.
 #   Optional new-data prediction.
 #
 # TECHNIQUES:
@@ -125,15 +131,31 @@ class PipelineConfig:
     val_percent: int = 20
     test_percent: int = 20
 
-    n_labels: int = 7
-    n_inputs: int = 10
+    # Phase A dataset layout
+    n_labels_a: int = 7
+    n_inputs_a: int = 10
+
+    # Phase B dataset layout (can differ from Phase A)
+    n_labels_b: int = 7
+    n_inputs_b: int = 10
+
     target_col: Optional[int] = None
     sep: str = "\t"
 
     disable_gpu: bool = True
 
-    # Fixed shared architecture (both datasets)
+    # Fixed shared architecture (Hill warmup + Phase A + Phase B)
     architecture: List[int] = field(default_factory=lambda: [256, 512, 128, 64, 32])
+
+    # Hill warmup settings
+    n_synthetic: int = 500
+    hill_v_max: float = 200.0
+    hill_k: float = 0.10
+    hill_n: float = 1.20
+    hill_x_min: float = 0.1
+    hill_x_max: float = 100.0
+    pretrain_epochs: int = 100
+    pretrain_tuner_trials: int = 15
 
     # Training
     tuner_trials: int = 15
@@ -145,7 +167,7 @@ class PipelineConfig:
 
     do_optional_retrain: bool = True
 
-    # Three-stage fine-tuning (Phase B)
+    # Three-stage fine-tuning
     ft_stage1_epochs: int = 20
     ft_stage1_lr: float = 1e-3
     ft_stage2_epochs: int = 40
@@ -154,7 +176,7 @@ class PipelineConfig:
     ft_stage3_epochs: int = 40
     ft_stage3_lr: float = 1e-4
 
-    # L2-SP strength during Phase B fine-tuning
+    # L2-SP strength
     l2sp_alpha: float = 1e-3
 
     # L-BFGS-B
@@ -195,6 +217,8 @@ cfg = PipelineConfig()
 print(f"Data split: TRAIN={cfg.train_percent}%  VAL={cfg.val_percent}%  "
       f"TEST={cfg.test_percent}%")
 print(f"Shared architecture: {cfg.architecture}")
+print(f"Phase A: n_labels={cfg.n_labels_a}  n_inputs={cfg.n_inputs_a}")
+print(f"Phase B: n_labels={cfg.n_labels_b}  n_inputs={cfg.n_inputs_b}")
 
 np.random.seed(cfg.random_seed)
 tf.random.set_seed(cfg.random_seed)
@@ -366,27 +390,27 @@ def upload_dataset(prompt_label=""):
     return file_name, df
 
 
-def select_columns(df):
+def select_columns(df, n_labels, n_inputs):
     """Return (labels_df, inputs_df, y_full, input_columns)."""
     n_cols = df.shape[1]
     if cfg.target_col is not None:
         target_idx = cfg.target_col
         if target_idx < 0 or target_idx >= n_cols:
             raise IndexError("target_col out of range.")
-        labels_df = df.iloc[:, :cfg.n_labels] if cfg.n_labels > 0 else pd.DataFrame()
-        input_cols = list(range(cfg.n_labels, n_cols))
+        labels_df = df.iloc[:, :n_labels] if n_labels > 0 else pd.DataFrame()
+        input_cols = list(range(n_labels, n_cols))
         input_cols.remove(target_idx)
         inputs_df = df.iloc[:, input_cols]
         y_full = df.iloc[:, target_idx].values.reshape(-1, 1)
-    elif cfg.n_labels + cfg.n_inputs >= n_cols:
+    elif n_labels + n_inputs >= n_cols:
         print("n_labels + n_inputs >= total columns. Using last column as target.")
-        labels_df = df.iloc[:, :cfg.n_labels] if cfg.n_labels > 0 else pd.DataFrame()
-        inputs_df = df.iloc[:, cfg.n_labels:-1]
+        labels_df = df.iloc[:, :n_labels] if n_labels > 0 else pd.DataFrame()
+        inputs_df = df.iloc[:, n_labels:-1]
         y_full = df.iloc[:, -1].values.reshape(-1, 1)
     else:
-        labels_df = df.iloc[:, :cfg.n_labels] if cfg.n_labels > 0 else pd.DataFrame()
-        inputs_df = df.iloc[:, cfg.n_labels:cfg.n_labels + cfg.n_inputs]
-        y_full = df.iloc[:, cfg.n_labels + cfg.n_inputs].values.reshape(-1, 1)
+        labels_df = df.iloc[:, :n_labels] if n_labels > 0 else pd.DataFrame()
+        inputs_df = df.iloc[:, n_labels:n_labels + n_inputs]
+        y_full = df.iloc[:, n_labels + n_inputs].values.reshape(-1, 1)
     print(f"Labels: {labels_df.shape}, Inputs: {inputs_df.shape}, y: {y_full.shape}")
     return labels_df, inputs_df, y_full, list(inputs_df.columns)
 
@@ -792,26 +816,369 @@ def make_zip(export_dir, zip_name):
         print(f"Error: {e}"); traceback.print_exc()
 
 
+def build_l2sp_regularisers(arch, ptw, alpha):
+    """Create L2-SP regulariser per Dense layer from stored weights."""
+    regs = []
+    layer_names = [f"dense_{i}" for i in range(len(arch))] + ["output"]
+    for name in layer_names:
+        if name in ptw:
+            regs.append(L2SP(alpha=alpha, w0=ptw[name][0]))
+        else:
+            regs.append(L2SP(alpha=alpha, w0=None))
+    return regs
+
+
+def snapshot_weights(model):
+    """Capture per-layer Dense weights and full model weights."""
+    per_layer = {}
+    for layer in model.layers:
+        if isinstance(layer, layers.Dense) and layer.weights:
+            per_layer[layer.name] = [w.numpy() for w in layer.weights]
+    full = [w.numpy() for w in model.get_weights()]
+    return per_layer, full
+
+
+def run_three_stage_finetune(model, d, pretrained_weights):
+    """Run 3-stage progressive unfreezing with L-BFGS-B."""
+    n_transferred = 0
+    for layer in model.layers:
+        if layer.name in pretrained_weights:
+            try:
+                layer.set_weights(pretrained_weights[layer.name])
+                n_transferred += 1
+            except Exception as e:
+                print(f"  Could not transfer {layer.name}: {e}")
+    print(f"Transferred weights for {n_transferred} layer(s).")
+    _eval_model(model, d["X_val"], d["y_val"], "after transfer, before fine-tune")
+
+    # Stage 1: output-only
+    print(f"\n--- Stage 1: output-only ({cfg.ft_stage1_epochs} ep, "
+          f"LR={cfg.ft_stage1_lr}) ---")
+    for layer in model.layers:
+        if isinstance(layer, layers.Dense) and layer.name != "output":
+            layer.trainable = False
+        if isinstance(layer, layers.Dropout):
+            layer.trainable = False
+
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage1_lr),
+                  loss="mse", metrics=["mae"])
+    model.fit(d["X_train"], d["y_train"],
+              validation_data=(d["X_val"], d["y_val"]),
+              epochs=cfg.ft_stage1_epochs, batch_size=32,
+              callbacks=[
+                  callbacks.EarlyStopping(monitor="val_loss", patience=8,
+                                          restore_best_weights=True),
+                  callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                              patience=4, min_lr=1e-5, verbose=1),
+              ], verbose=1)
+    _eval_model(model, d["X_val"], d["y_val"], "after Stage 1 (Adam)")
+    model = lbfgs_refine(model, d["X_train"], d["y_train"],
+                          X_va=d["X_val"], y_va=d["y_val"],
+                          maxiter=cfg.lbfgs_maxiter)
+
+    # Stage 2: unfreeze last N
+    n_unfreeze = cfg.ft_stage2_unfreeze_last_n
+    dense_names = [l.name for l in model.layers if isinstance(l, layers.Dense)]
+    unfreeze_names = set(dense_names[-n_unfreeze:])
+    print(f"\n--- Stage 2: unfreeze {unfreeze_names} ({cfg.ft_stage2_epochs} ep, "
+          f"LR={cfg.ft_stage2_lr}) ---")
+
+    for layer in model.layers:
+        if layer.name in unfreeze_names:
+            layer.trainable = True
+        drop_name = layer.name.replace("dense_", "drop_")
+        if isinstance(layer, layers.Dropout) and drop_name in unfreeze_names:
+            layer.trainable = True
+
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage2_lr),
+                  loss="mse", metrics=["mae"])
+    model.fit(d["X_train"], d["y_train"],
+              validation_data=(d["X_val"], d["y_val"]),
+              epochs=cfg.ft_stage2_epochs, batch_size=32,
+              callbacks=[
+                  callbacks.EarlyStopping(monitor="val_loss", patience=10,
+                                          restore_best_weights=True),
+                  callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                              patience=5, min_lr=1e-5, verbose=1),
+              ], verbose=1)
+    _eval_model(model, d["X_val"], d["y_val"], "after Stage 2 (Adam)")
+    model = lbfgs_refine(model, d["X_train"], d["y_train"],
+                          X_va=d["X_val"], y_va=d["y_val"],
+                          maxiter=cfg.lbfgs_maxiter)
+
+    # Stage 3: full unfreeze
+    print(f"\n--- Stage 3: full unfreeze ({cfg.ft_stage3_epochs} ep, "
+          f"LR={cfg.ft_stage3_lr}) ---")
+    for layer in model.layers:
+        layer.trainable = True
+
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage3_lr),
+                  loss="mse", metrics=["mae"])
+    model.fit(d["X_train"], d["y_train"],
+              validation_data=(d["X_val"], d["y_val"]),
+              epochs=cfg.ft_stage3_epochs, batch_size=32,
+              callbacks=[
+                  callbacks.EarlyStopping(monitor="val_loss", patience=12,
+                                          restore_best_weights=True),
+                  callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                              patience=5, min_lr=1e-6, verbose=1),
+              ], verbose=1)
+    _eval_model(model, d["X_val"], d["y_val"], "after Stage 3 (Adam)")
+    model = lbfgs_refine(model, d["X_train"], d["y_train"],
+                          X_va=d["X_val"], y_va=d["y_val"],
+                          maxiter=cfg.lbfgs_maxiter)
+    _eval_model(model, d["X_val"], d["y_val"], "after Stage 3 (L-BFGS-B, final)")
+
+    return model, n_transferred
+
+
+def run_cv(d, build_fn, best_hp, init_weights=None):
+    """K-fold CV on TRAIN (no leakage). Returns (q2, r2_list, rmse_list, mae_list, oof_pred, oof_true)."""
+    kf = KFold(n_splits=cfg.k_folds, shuffle=True, random_state=cfg.random_seed)
+    r2_list, rmse_list, mae_list = [], [], []
+    y_oof_pred = np.full(len(d["y_train_orig"]), np.nan)
+    y_oof_true = np.full(len(d["y_train_orig"]), np.nan)
+
+    print(f"{cfg.k_folds}-fold CV (no leakage)...")
+    for fold, (tr_idx, va_idx) in enumerate(kf.split(d["X_train_orig"]), start=1):
+        X_tr = d["X_train_orig"][tr_idx]; X_va = d["X_train_orig"][va_idx]
+        y_tr = d["y_train_orig"][tr_idx]; y_va = d["y_train_orig"][va_idx]
+
+        fsx = StandardScaler().fit(X_tr); fsy = StandardScaler().fit(y_tr)
+        X_tr_s, X_va_s = fsx.transform(X_tr), fsx.transform(X_va)
+        y_tr_s, y_va_s = fsy.transform(y_tr), fsy.transform(y_va)
+
+        mf = build_fn(best_hp)
+        if init_weights is not None:
+            try:
+                mf.set_weights(init_weights)
+            except Exception:
+                pass
+        mf.fit(X_tr_s, y_tr_s, validation_data=(X_va_s, y_va_s),
+               epochs=cfg.cv_epochs, batch_size=32,
+               callbacks=[
+                   callbacks.EarlyStopping(monitor="val_loss", patience=10,
+                                           restore_best_weights=True),
+                   callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                               patience=5, min_lr=1e-5, verbose=0),
+               ], verbose=1)
+        mf = lbfgs_refine(mf, X_tr_s, y_tr_s, X_va=X_va_s, y_va=y_va_s,
+                           maxiter=cfg.lbfgs_maxiter, verbose=False)
+
+        vp = fsy.inverse_transform(mf.predict(X_va_s, verbose=0)).reshape(-1)
+        vt = y_va.reshape(-1)
+        y_oof_pred[va_idx] = vp; y_oof_true[va_idx] = vt
+
+        r2_list.append(r2_score(vt, vp))
+        rmse_list.append(float(np.sqrt(mean_squared_error(vt, vp))))
+        mae_list.append(float(np.mean(np.abs(vt - vp))))
+        print(f"Fold {fold}: R2={r2_list[-1]:.4f}  RMSE={rmse_list[-1]:.4f}  MAE={mae_list[-1]:.4f}")
+
+    ss_res = np.sum((y_oof_true - y_oof_pred)**2)
+    ss_tot = np.sum((y_oof_true - np.mean(y_oof_true))**2)
+    q2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
+    print(f"\nCV:  R2={np.mean(r2_list):.4f}+/-{np.std(r2_list):.4f}  "
+          f"RMSE={np.mean(rmse_list):.4f}  MAE={np.mean(mae_list):.4f}  Q2={q2:.4f}")
+    return q2, r2_list, rmse_list, mae_list, y_oof_pred, y_oof_true
+
+
+def run_final_training(d, build_fn, best_hp, export_dir, init_weights=None):
+    """Final training + optional retrain. Returns (model, history, best_epoch, d_updated)."""
+    os.makedirs(export_dir, exist_ok=True)
+    ckpt = os.path.join(export_dir, "best_model.keras")
+
+    tf.keras.backend.clear_session()
+    model = build_fn(best_hp)
+    if init_weights is not None:
+        try:
+            model.set_weights(init_weights)
+            print("Initialised from pre-trained weights.")
+        except Exception as e:
+            print(f"Could not init: {e}")
+
+    history = model.fit(
+        d["X_train"], d["y_train"],
+        validation_data=(d["X_val"], d["y_val"]),
+        epochs=cfg.final_epochs, batch_size=32,
+        callbacks=[
+            callbacks.EarlyStopping(monitor="val_loss", patience=20,
+                                    restore_best_weights=True),
+            callbacks.ModelCheckpoint(ckpt, monitor="val_loss",
+                                      save_best_only=True, verbose=1),
+            callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                        patience=8, min_lr=1e-6, verbose=1),
+        ], verbose=1,
+    )
+
+    if os.path.exists(ckpt):
+        model = keras.models.load_model(ckpt, compile=False)
+
+    best_epoch = int(np.argmin(history.history["val_loss"]) + 1)
+    print(f"Best epoch: {best_epoch}")
+
+    print("Refining with L-BFGS-B...")
+    model.compile(loss="mse", metrics=["mae"])
+    model = lbfgs_refine(model, d["X_train"], d["y_train"],
+                          X_va=d["X_val"], y_va=d["y_val"],
+                          maxiter=cfg.lbfgs_maxiter)
+
+    if cfg.do_optional_retrain:
+        print("\nRetrain on TRAIN+VAL.")
+        X_tv = np.vstack([d["X_train_orig"], d["X_val_orig"]])
+        y_tv = np.vstack([d["y_train_orig"], d["y_val_orig"]])
+        sx_tv = StandardScaler().fit(X_tv)
+        sy_tv = StandardScaler().fit(y_tv)
+
+        tf.keras.backend.clear_session()
+        model = build_fn(best_hp)
+        if init_weights is not None:
+            try:
+                model.set_weights(init_weights)
+            except Exception:
+                pass
+        X_tv_s = sx_tv.transform(X_tv); y_tv_s = sy_tv.transform(y_tv)
+        model.fit(X_tv_s, y_tv_s, epochs=best_epoch, batch_size=32,
+                  callbacks=[callbacks.ReduceLROnPlateau(
+                      monitor="loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1)],
+                  verbose=1)
+        model = lbfgs_refine(model, X_tv_s, y_tv_s, maxiter=cfg.lbfgs_maxiter)
+
+        d["scaler_X"] = sx_tv; d["scaler_y"] = sy_tv
+        d["X_train"] = sx_tv.transform(d["X_train_orig"])
+        d["X_val"] = sx_tv.transform(d["X_val_orig"])
+        d["X_test"] = sx_tv.transform(d["X_test_orig"])
+        d["y_train"] = sy_tv.transform(d["y_train_orig"])
+        d["y_val"] = sy_tv.transform(d["y_val_orig"])
+        d["y_test"] = sy_tv.transform(d["y_test_orig"])
+
+        y_pred_rt = sy_tv.inverse_transform(
+            model.predict(sx_tv.transform(d["X_test_orig"]), verbose=0)).reshape(-1)
+        y_true_rt = d["y_test_orig"].reshape(-1)
+        print(f"TEST (retrained): R2={r2_score(y_true_rt, y_pred_rt):.4f}  "
+              f"RMSE={np.sqrt(mean_squared_error(y_true_rt, y_pred_rt)):.4f}")
+
+    return model, history, best_epoch, d
+
+
 # #############################################################################
 #
-#  PHASE A: PRE-TRAIN ON DATASET 1
+#  HILL WARMUP — SYNTHETIC PRE-TRAINING
 #
 # #############################################################################
 print("\n" + "=" * 80)
-print("PHASE A: PRE-TRAINING ON DATASET 1")
+print("HILL WARMUP: SYNTHETIC DATA PRE-TRAINING")
 print("=" * 80)
 
-file_name_a, df_a = upload_dataset("Dataset 1 (pre-training) ")
-labels_a, inputs_a, y_a, input_columns_a = select_columns(df_a)
-d_a = split_and_scale(inputs_a.values, y_a, labels_a, np.arange(len(df_a)))
-n_features = d_a["X_train"].shape[1]
 
-# --- Tune on Dataset 1 ---
+def _generate_hill_data(n_samples, n_features, v_max, k, n_hill, x_min, x_max):
+    X = np.random.uniform(x_min, x_max, (n_samples, n_features)).astype(np.float32)
+    x1 = X[:, 0]
+    y = v_max * (x1 ** n_hill) / (k ** n_hill + x1 ** n_hill)
+    y += np.random.normal(0, 0.05 * v_max, n_samples)
+    for i in range(1, min(n_features, 3)):
+        y += 0.05 * v_max * (X[:, i] - x_min) / (x_max - x_min)
+    return X, y.reshape(-1, 1)
+
+
+# Use the larger of n_inputs_a and n_inputs_b for synthetic features
+hill_n_features = max(cfg.n_inputs_a, cfg.n_inputs_b)
+X_h, y_h = _generate_hill_data(
+    cfg.n_synthetic, hill_n_features, cfg.hill_v_max,
+    cfg.hill_k, cfg.hill_n, cfg.hill_x_min, cfg.hill_x_max,
+)
+
+scaler_Xh = StandardScaler().fit(X_h)
+scaler_yh = StandardScaler().fit(y_h)
+X_h_scaled = scaler_Xh.transform(X_h)
+y_h_scaled = scaler_yh.transform(y_h)
+
+X_h_train, X_h_val, y_h_train, y_h_val = train_test_split(
+    X_h_scaled, y_h_scaled, test_size=0.2, random_state=cfg.random_seed
+)
+print(f"Synthetic data: {X_h.shape[0]} samples, {X_h.shape[1]} features (standardised)")
+
+# Tune on synthetic
+print("\n" + "-" * 60)
+print("HILL WARMUP: Tuning dropout/L2/LR (fixed architecture)")
+print("-" * 60)
+
+build_fn_hill = make_fixed_builder(hill_n_features, cfg.architecture)
+
+tuner_hill = kt.RandomSearch(
+    build_fn_hill, objective="val_loss",
+    max_trials=cfg.pretrain_tuner_trials, executions_per_trial=1,
+    directory="tuner_results", project_name="hill_warmup",
+)
+tuner_hill.search(
+    X_h_train, y_h_train, validation_data=(X_h_val, y_h_val),
+    epochs=min(cfg.tuner_epochs, 100), batch_size=32, verbose=1,
+)
+
+best_hp_hill = tuner_hill.get_best_hyperparameters(1)[0]
+print("\nBest HPs (Hill warmup):")
+for k_hp, v_hp in best_hp_hill.values.items():
+    print(f"  {k_hp}: {v_hp}")
+
+# Train warmup model
+print("\n" + "-" * 60)
+print("HILL WARMUP: Training warmup model")
+print("-" * 60)
+
+tf.keras.backend.clear_session()
+warmup_model = build_fn_hill(best_hp_hill)
+
+es_w = callbacks.EarlyStopping(monitor="val_loss", patience=15,
+                                restore_best_weights=True)
+rlr_w = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                     patience=7, min_lr=1e-6, verbose=1)
+warmup_model.fit(
+    X_h_train, y_h_train, validation_data=(X_h_val, y_h_val),
+    epochs=cfg.pretrain_epochs, batch_size=32,
+    callbacks=[es_w, rlr_w], verbose=1,
+)
+
+warmup_val = warmup_model.evaluate(X_h_val, y_h_val, verbose=0)
+print(f"\nWarmup (Adam):  val_loss={warmup_val[0]:.6f}  val_mae={warmup_val[1]:.6f}")
+
+print("Refining warmup with L-BFGS-B...")
+warmup_model = lbfgs_refine(warmup_model, X_h_train, y_h_train,
+                             X_va=X_h_val, y_va=y_h_val,
+                             maxiter=cfg.lbfgs_maxiter)
+
+hill_weights, hill_full_weights = snapshot_weights(warmup_model)
+print(f"Captured Hill warmup weights: {list(hill_weights.keys())}")
+
+print("\n" + "=" * 80)
+print("HILL WARMUP COMPLETE.")
+print("=" * 80)
+
+
+# #############################################################################
+#
+#  PHASE A: TRAIN ON DATASET 1
+#
+# #############################################################################
+print("\n" + "=" * 80)
+print("PHASE A: TRAINING ON DATASET 1")
+print("=" * 80)
+
+file_name_a, df_a = upload_dataset("Dataset 1 (Phase A) ")
+labels_a, inputs_a, y_a, input_columns_a = select_columns(
+    df_a, cfg.n_labels_a, cfg.n_inputs_a)
+d_a = split_and_scale(inputs_a.values, y_a, labels_a, np.arange(len(df_a)))
+n_features_a = d_a["X_train"].shape[1]
+
+# Build L2-SP model using Hill warmup weights
+l2sp_regs_a = build_l2sp_regularisers(cfg.architecture, hill_weights,
+                                       cfg.l2sp_alpha)
+build_fn_a_l2sp = make_fixed_builder(n_features_a, cfg.architecture,
+                                      kernel_regularizers=l2sp_regs_a)
+build_fn_a = make_fixed_builder(n_features_a, cfg.architecture)
+
+# Tune on Dataset 1
 print("\n" + "-" * 60)
 print("PHASE A: Hyperparameter tuning (fixed architecture)")
 print("-" * 60)
-
-build_fn_a = make_fixed_builder(n_features, cfg.architecture)
 
 tuner_a = kt.RandomSearch(
     build_fn_a, objective="val_loss",
@@ -827,135 +1194,47 @@ print("\nBest HPs (Dataset 1):")
 for k_hp, v_hp in best_hp_a.values.items():
     print(f"  {k_hp}: {v_hp}")
 
-# --- K-fold CV on Dataset 1 ---
+# Three-stage fine-tuning with Hill warmup weights
 print("\n" + "-" * 60)
-print(f"PHASE A: {cfg.k_folds}-fold CV (no leakage)")
+print("PHASE A: Weight transfer from Hill warmup + 3-stage fine-tuning")
 print("-" * 60)
 
-kf_a = KFold(n_splits=cfg.k_folds, shuffle=True, random_state=cfg.random_seed)
-r2_a, rmse_a, mae_a = [], [], []
-y_oof_pred_a = np.full(len(d_a["y_train_orig"]), np.nan)
-y_oof_true_a = np.full(len(d_a["y_train_orig"]), np.nan)
+tf.keras.backend.clear_session()
+model_a_ft = build_fn_a_l2sp(best_hp_a)
+model_a_ft, n_transferred_a = run_three_stage_finetune(
+    model_a_ft, d_a, hill_weights)
+ft_weights_a = [w.numpy() for w in model_a_ft.get_weights()]
+print("\nPhase A fine-tuning complete.")
 
-for fold, (tr_idx, va_idx) in enumerate(kf_a.split(d_a["X_train_orig"]), start=1):
-    X_tr = d_a["X_train_orig"][tr_idx]; X_va = d_a["X_train_orig"][va_idx]
-    y_tr = d_a["y_train_orig"][tr_idx]; y_va = d_a["y_train_orig"][va_idx]
+# CV on Dataset 1
+print("\n" + "-" * 60)
+print(f"PHASE A: {cfg.k_folds}-fold CV")
+print("-" * 60)
 
-    fsx = StandardScaler().fit(X_tr); fsy = StandardScaler().fit(y_tr)
-    X_tr_s, X_va_s = fsx.transform(X_tr), fsx.transform(X_va)
-    y_tr_s, y_va_s = fsy.transform(y_tr), fsy.transform(y_va)
+q2_a, r2_a, rmse_a, mae_a, y_oof_pred_a, y_oof_true_a = run_cv(
+    d_a, build_fn_a, best_hp_a, init_weights=ft_weights_a)
 
-    mf = build_fn_a(best_hp_a)
-    mf.fit(X_tr_s, y_tr_s, validation_data=(X_va_s, y_va_s),
-           epochs=cfg.cv_epochs, batch_size=32,
-           callbacks=[
-               callbacks.EarlyStopping(monitor="val_loss", patience=10,
-                                       restore_best_weights=True),
-               callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                           patience=5, min_lr=1e-5, verbose=0),
-           ], verbose=1)
-    mf = lbfgs_refine(mf, X_tr_s, y_tr_s, X_va=X_va_s, y_va=y_va_s,
-                       maxiter=cfg.lbfgs_maxiter, verbose=False)
-
-    vp = fsy.inverse_transform(mf.predict(X_va_s, verbose=0)).reshape(-1)
-    vt = y_va.reshape(-1)
-    y_oof_pred_a[va_idx] = vp; y_oof_true_a[va_idx] = vt
-
-    r2_a.append(r2_score(vt, vp))
-    rmse_a.append(float(np.sqrt(mean_squared_error(vt, vp))))
-    mae_a.append(float(np.mean(np.abs(vt - vp))))
-    print(f"Fold {fold}: R2={r2_a[-1]:.4f}  RMSE={rmse_a[-1]:.4f}  MAE={mae_a[-1]:.4f}")
-
-ss_res = np.sum((y_oof_true_a - y_oof_pred_a)**2)
-ss_tot = np.sum((y_oof_true_a - np.mean(y_oof_true_a))**2)
-q2_a = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
-print(f"\nCV:  R2={np.mean(r2_a):.4f}+/-{np.std(r2_a):.4f}  "
-      f"RMSE={np.mean(rmse_a):.4f}  MAE={np.mean(mae_a):.4f}  Q2={q2_a:.4f}")
-
-# --- Final training on Dataset 1 ---
+# Final training
 print("\n" + "-" * 60)
 print("PHASE A: Final training on Dataset 1")
 print("-" * 60)
 
-os.makedirs(cfg.export_dir_a, exist_ok=True)
-ckpt_a = os.path.join(cfg.export_dir_a, "best_model.keras")
-
-tf.keras.backend.clear_session()
-model_a = build_fn_a(best_hp_a)
-history_a = model_a.fit(
-    d_a["X_train"], d_a["y_train"],
-    validation_data=(d_a["X_val"], d_a["y_val"]),
-    epochs=cfg.final_epochs, batch_size=32,
-    callbacks=[
-        callbacks.EarlyStopping(monitor="val_loss", patience=20,
-                                restore_best_weights=True),
-        callbacks.ModelCheckpoint(ckpt_a, monitor="val_loss",
-                                  save_best_only=True, verbose=1),
-        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                    patience=8, min_lr=1e-6, verbose=1),
-    ], verbose=1,
-)
-
-if os.path.exists(ckpt_a):
-    model_a = keras.models.load_model(ckpt_a, compile=False)
-
-best_epoch_a = int(np.argmin(history_a.history["val_loss"]) + 1)
-print(f"Best epoch: {best_epoch_a}")
-
-print("Refining Dataset 1 model with L-BFGS-B...")
-model_a.compile(loss="mse", metrics=["mae"])
-model_a = lbfgs_refine(model_a, d_a["X_train"], d_a["y_train"],
-                         X_va=d_a["X_val"], y_va=d_a["y_val"],
-                         maxiter=cfg.lbfgs_maxiter)
-
-# Optional retrain on TRAIN+VAL
-if cfg.do_optional_retrain:
-    print("\nRetrain on TRAIN+VAL (Dataset 1).")
-    X_tv_a = np.vstack([d_a["X_train_orig"], d_a["X_val_orig"]])
-    y_tv_a = np.vstack([d_a["y_train_orig"], d_a["y_val_orig"]])
-    sx_tv = StandardScaler().fit(X_tv_a)
-    sy_tv = StandardScaler().fit(y_tv_a)
-
-    tf.keras.backend.clear_session()
-    model_a = build_fn_a(best_hp_a)
-    X_tv_s = sx_tv.transform(X_tv_a); y_tv_s = sy_tv.transform(y_tv_a)
-    model_a.fit(X_tv_s, y_tv_s, epochs=best_epoch_a, batch_size=32,
-                callbacks=[callbacks.ReduceLROnPlateau(
-                    monitor="loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1)],
-                verbose=1)
-    model_a = lbfgs_refine(model_a, X_tv_s, y_tv_s, maxiter=cfg.lbfgs_maxiter)
-
-    d_a["scaler_X"] = sx_tv; d_a["scaler_y"] = sy_tv
-    d_a["X_train"] = sx_tv.transform(d_a["X_train_orig"])
-    d_a["X_val"] = sx_tv.transform(d_a["X_val_orig"])
-    d_a["X_test"] = sx_tv.transform(d_a["X_test_orig"])
-    d_a["y_train"] = sy_tv.transform(d_a["y_train_orig"])
-    d_a["y_val"] = sy_tv.transform(d_a["y_val_orig"])
-    d_a["y_test"] = sy_tv.transform(d_a["y_test_orig"])
-
-    y_pred_rt = sy_tv.inverse_transform(
-        model_a.predict(sx_tv.transform(d_a["X_test_orig"]), verbose=0)).reshape(-1)
-    y_true_rt = d_a["y_test_orig"].reshape(-1)
-    print(f"TEST (retrained): R2={r2_score(y_true_rt, y_pred_rt):.4f}  "
-          f"RMSE={np.sqrt(mean_squared_error(y_true_rt, y_pred_rt)):.4f}")
+model_a, history_a, best_epoch_a, d_a = run_final_training(
+    d_a, build_fn_a, best_hp_a, cfg.export_dir_a, init_weights=ft_weights_a)
 
 # Diagnostics
 diag_a = run_diagnostics(
     model_a, d_a, df_a, input_columns_a, cfg.export_dir_a,
-    history_a, best_epoch_a, q2_a, best_hp_a, "Phase A (Dataset 1)")
+    history_a, best_epoch_a, q2_a, best_hp_a, "Phase A (Dataset 1)",
+    n_transferred=n_transferred_a)
 
-# Snapshot pre-trained weights
-pretrained_weights = {}
-for layer in model_a.layers:
-    if isinstance(layer, layers.Dense) and layer.weights:
-        pretrained_weights[layer.name] = [w.numpy() for w in layer.weights]
-pretrained_model_weights = [w.numpy() for w in model_a.get_weights()]
-
-print(f"\nCaptured pre-trained weights: {list(pretrained_weights.keys())}")
+# Snapshot Phase A weights for transfer to Phase B
+phase_a_weights, phase_a_full_weights = snapshot_weights(model_a)
+print(f"\nCaptured Phase A weights: {list(phase_a_weights.keys())}")
 make_zip(cfg.export_dir_a, "dataset1_results.zip")
 
 print("\n" + "=" * 80)
-print("PHASE A COMPLETE. Model pre-trained on Dataset 1.")
+print("PHASE A COMPLETE.")
 print("=" * 80)
 
 
@@ -968,36 +1247,20 @@ print("\n" + "=" * 80)
 print("PHASE B: FINE-TUNING ON DATASET 2")
 print("=" * 80)
 
-file_name_b, df_b = upload_dataset("Dataset 2 (fine-tuning) ")
-labels_b, inputs_b, y_b, input_columns_b = select_columns(df_b)
+file_name_b, df_b = upload_dataset("Dataset 2 (Phase B) ")
+labels_b, inputs_b, y_b, input_columns_b = select_columns(
+    df_b, cfg.n_labels_b, cfg.n_inputs_b)
 d_b = split_and_scale(inputs_b.values, y_b, labels_b, np.arange(len(df_b)))
 n_features_b = d_b["X_train"].shape[1]
 
-if n_features_b != n_features:
-    raise ValueError(
-        f"Dataset 2 has {n_features_b} input features but Dataset 1 had "
-        f"{n_features}. They must match for weight transfer."
-    )
-
-# --- Build L2-SP regularised model ---
-def build_l2sp_regularisers(arch, ptw, alpha):
-    regs = []
-    layer_names = [f"dense_{i}" for i in range(len(arch))] + ["output"]
-    for name in layer_names:
-        if name in ptw:
-            regs.append(L2SP(alpha=alpha, w0=ptw[name][0]))
-        else:
-            regs.append(L2SP(alpha=alpha, w0=None))
-    return regs
-
-
-l2sp_regs = build_l2sp_regularisers(cfg.architecture, pretrained_weights,
-                                     cfg.l2sp_alpha)
+# Build L2-SP model using Phase A weights
+l2sp_regs_b = build_l2sp_regularisers(cfg.architecture, phase_a_weights,
+                                       cfg.l2sp_alpha)
 build_fn_b_l2sp = make_fixed_builder(n_features_b, cfg.architecture,
-                                      kernel_regularizers=l2sp_regs)
+                                      kernel_regularizers=l2sp_regs_b)
 build_fn_b = make_fixed_builder(n_features_b, cfg.architecture)
 
-# --- Tune dropout/L2/LR on Dataset 2 ---
+# Tune on Dataset 2
 print("\n" + "-" * 60)
 print("PHASE B: Hyperparameter tuning on Dataset 2")
 print("-" * 60)
@@ -1016,242 +1279,44 @@ print("\nBest HPs (Dataset 2):")
 for k_hp, v_hp in best_hp_b.values.items():
     print(f"  {k_hp}: {v_hp}")
 
-# --- Three-stage progressive fine-tuning ---
+# Three-stage fine-tuning with Phase A weights
 print("\n" + "-" * 60)
-print("PHASE B: Weight transfer + 3-stage progressive fine-tuning")
+print("PHASE B: Weight transfer from Phase A + 3-stage fine-tuning")
 print("-" * 60)
 
 tf.keras.backend.clear_session()
-model_ft = build_fn_b_l2sp(best_hp_b)
+model_b_ft = build_fn_b_l2sp(best_hp_b)
+model_b_ft, n_transferred_b = run_three_stage_finetune(
+    model_b_ft, d_b, phase_a_weights)
+ft_weights_b = [w.numpy() for w in model_b_ft.get_weights()]
+print("\nPhase B fine-tuning complete.")
 
-n_transferred = 0
-for layer in model_ft.layers:
-    if layer.name in pretrained_weights:
-        try:
-            layer.set_weights(pretrained_weights[layer.name])
-            n_transferred += 1
-        except Exception as e:
-            print(f"  Could not transfer {layer.name}: {e}")
-print(f"Transferred weights for {n_transferred} layer(s).")
-_eval_model(model_ft, d_b["X_val"], d_b["y_val"], "after transfer, before fine-tune")
-
-# Stage 1: output-only
-print(f"\n--- Stage 1: output-only ({cfg.ft_stage1_epochs} ep, LR={cfg.ft_stage1_lr}) ---")
-for layer in model_ft.layers:
-    if isinstance(layer, layers.Dense) and layer.name != "output":
-        layer.trainable = False
-    if isinstance(layer, layers.Dropout):
-        layer.trainable = False
-
-model_ft.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage1_lr),
-                 loss="mse", metrics=["mae"])
-model_ft.fit(d_b["X_train"], d_b["y_train"],
-             validation_data=(d_b["X_val"], d_b["y_val"]),
-             epochs=cfg.ft_stage1_epochs, batch_size=32,
-             callbacks=[
-                 callbacks.EarlyStopping(monitor="val_loss", patience=8,
-                                         restore_best_weights=True),
-                 callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                             patience=4, min_lr=1e-5, verbose=1),
-             ], verbose=1)
-_eval_model(model_ft, d_b["X_val"], d_b["y_val"], "after Stage 1 (Adam)")
-model_ft = lbfgs_refine(model_ft, d_b["X_train"], d_b["y_train"],
-                         X_va=d_b["X_val"], y_va=d_b["y_val"],
-                         maxiter=cfg.lbfgs_maxiter)
-
-# Stage 2: unfreeze last N
-n_unfreeze = cfg.ft_stage2_unfreeze_last_n
-dense_names = [l.name for l in model_ft.layers if isinstance(l, layers.Dense)]
-unfreeze_names = set(dense_names[-n_unfreeze:])
-print(f"\n--- Stage 2: unfreeze {unfreeze_names} ({cfg.ft_stage2_epochs} ep, "
-      f"LR={cfg.ft_stage2_lr}) ---")
-
-for layer in model_ft.layers:
-    if layer.name in unfreeze_names:
-        layer.trainable = True
-    drop_name = layer.name.replace("dense_", "drop_")
-    if isinstance(layer, layers.Dropout) and drop_name in unfreeze_names:
-        layer.trainable = True
-
-model_ft.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage2_lr),
-                 loss="mse", metrics=["mae"])
-model_ft.fit(d_b["X_train"], d_b["y_train"],
-             validation_data=(d_b["X_val"], d_b["y_val"]),
-             epochs=cfg.ft_stage2_epochs, batch_size=32,
-             callbacks=[
-                 callbacks.EarlyStopping(monitor="val_loss", patience=10,
-                                         restore_best_weights=True),
-                 callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                             patience=5, min_lr=1e-5, verbose=1),
-             ], verbose=1)
-_eval_model(model_ft, d_b["X_val"], d_b["y_val"], "after Stage 2 (Adam)")
-model_ft = lbfgs_refine(model_ft, d_b["X_train"], d_b["y_train"],
-                         X_va=d_b["X_val"], y_va=d_b["y_val"],
-                         maxiter=cfg.lbfgs_maxiter)
-
-# Stage 3: full unfreeze
-print(f"\n--- Stage 3: full unfreeze ({cfg.ft_stage3_epochs} ep, "
-      f"LR={cfg.ft_stage3_lr}) ---")
-for layer in model_ft.layers:
-    layer.trainable = True
-
-model_ft.compile(optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage3_lr),
-                 loss="mse", metrics=["mae"])
-model_ft.fit(d_b["X_train"], d_b["y_train"],
-             validation_data=(d_b["X_val"], d_b["y_val"]),
-             epochs=cfg.ft_stage3_epochs, batch_size=32,
-             callbacks=[
-                 callbacks.EarlyStopping(monitor="val_loss", patience=12,
-                                         restore_best_weights=True),
-                 callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                             patience=5, min_lr=1e-6, verbose=1),
-             ], verbose=1)
-_eval_model(model_ft, d_b["X_val"], d_b["y_val"], "after Stage 3 (Adam)")
-model_ft = lbfgs_refine(model_ft, d_b["X_train"], d_b["y_train"],
-                         X_va=d_b["X_val"], y_va=d_b["y_val"],
-                         maxiter=cfg.lbfgs_maxiter)
-_eval_model(model_ft, d_b["X_val"], d_b["y_val"], "after Stage 3 (L-BFGS-B, final)")
-
-ft_weights = [w.numpy() for w in model_ft.get_weights()]
-
-print("\nFine-tuning complete.")
-
-# --- K-fold CV on Dataset 2 ---
+# CV on Dataset 2
 print("\n" + "-" * 60)
-print(f"PHASE B: {cfg.k_folds}-fold CV on Dataset 2 (no leakage)")
+print(f"PHASE B: {cfg.k_folds}-fold CV on Dataset 2")
 print("-" * 60)
 
-kf_b = KFold(n_splits=cfg.k_folds, shuffle=True, random_state=cfg.random_seed)
-r2_b, rmse_b, mae_b = [], [], []
-y_oof_pred_b = np.full(len(d_b["y_train_orig"]), np.nan)
-y_oof_true_b = np.full(len(d_b["y_train_orig"]), np.nan)
+q2_b, r2_b, rmse_b, mae_b, y_oof_pred_b, y_oof_true_b = run_cv(
+    d_b, build_fn_b, best_hp_b, init_weights=ft_weights_b)
 
-for fold, (tr_idx, va_idx) in enumerate(kf_b.split(d_b["X_train_orig"]), start=1):
-    X_tr = d_b["X_train_orig"][tr_idx]; X_va = d_b["X_train_orig"][va_idx]
-    y_tr = d_b["y_train_orig"][tr_idx]; y_va = d_b["y_train_orig"][va_idx]
-
-    fsx = StandardScaler().fit(X_tr); fsy = StandardScaler().fit(y_tr)
-    X_tr_s, X_va_s = fsx.transform(X_tr), fsx.transform(X_va)
-    y_tr_s, y_va_s = fsy.transform(y_tr), fsy.transform(y_va)
-
-    mf = build_fn_b(best_hp_b)
-    try:
-        mf.set_weights(ft_weights)
-    except Exception:
-        pass
-    mf.fit(X_tr_s, y_tr_s, validation_data=(X_va_s, y_va_s),
-           epochs=cfg.cv_epochs, batch_size=32,
-           callbacks=[
-               callbacks.EarlyStopping(monitor="val_loss", patience=10,
-                                       restore_best_weights=True),
-               callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                           patience=5, min_lr=1e-5, verbose=0),
-           ], verbose=1)
-    mf = lbfgs_refine(mf, X_tr_s, y_tr_s, X_va=X_va_s, y_va=y_va_s,
-                       maxiter=cfg.lbfgs_maxiter, verbose=False)
-
-    vp = fsy.inverse_transform(mf.predict(X_va_s, verbose=0)).reshape(-1)
-    vt = y_va.reshape(-1)
-    y_oof_pred_b[va_idx] = vp; y_oof_true_b[va_idx] = vt
-
-    r2_b.append(r2_score(vt, vp))
-    rmse_b.append(float(np.sqrt(mean_squared_error(vt, vp))))
-    mae_b.append(float(np.mean(np.abs(vt - vp))))
-    print(f"Fold {fold}: R2={r2_b[-1]:.4f}  RMSE={rmse_b[-1]:.4f}  MAE={mae_b[-1]:.4f}")
-
-ss_res_b = np.sum((y_oof_true_b - y_oof_pred_b)**2)
-ss_tot_b = np.sum((y_oof_true_b - np.mean(y_oof_true_b))**2)
-q2_b = 1.0 - ss_res_b / ss_tot_b if ss_tot_b != 0 else np.nan
-print(f"\nCV:  R2={np.mean(r2_b):.4f}+/-{np.std(r2_b):.4f}  "
-      f"RMSE={np.mean(rmse_b):.4f}  MAE={np.mean(mae_b):.4f}  Q2={q2_b:.4f}")
-
-# --- Final training on Dataset 2 ---
+# Final training
 print("\n" + "-" * 60)
 print("PHASE B: Final training on Dataset 2")
 print("-" * 60)
 
-os.makedirs(cfg.export_dir_b, exist_ok=True)
-ckpt_b = os.path.join(cfg.export_dir_b, "best_model.keras")
-
-tf.keras.backend.clear_session()
-model_b = build_fn_b(best_hp_b)
-try:
-    model_b.set_weights(ft_weights)
-    print("Initialised from fine-tuned weights.")
-except Exception as e:
-    print(f"Could not init: {e}")
-
-history_b = model_b.fit(
-    d_b["X_train"], d_b["y_train"],
-    validation_data=(d_b["X_val"], d_b["y_val"]),
-    epochs=cfg.final_epochs, batch_size=32,
-    callbacks=[
-        callbacks.EarlyStopping(monitor="val_loss", patience=20,
-                                restore_best_weights=True),
-        callbacks.ModelCheckpoint(ckpt_b, monitor="val_loss",
-                                  save_best_only=True, verbose=1),
-        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                    patience=8, min_lr=1e-6, verbose=1),
-    ], verbose=1,
-)
-
-if os.path.exists(ckpt_b):
-    model_b = keras.models.load_model(ckpt_b, compile=False)
-
-best_epoch_b = int(np.argmin(history_b.history["val_loss"]) + 1)
-print(f"Best epoch: {best_epoch_b}")
-
-print("Refining Dataset 2 model with L-BFGS-B...")
-model_b.compile(loss="mse", metrics=["mae"])
-model_b = lbfgs_refine(model_b, d_b["X_train"], d_b["y_train"],
-                         X_va=d_b["X_val"], y_va=d_b["y_val"],
-                         maxiter=cfg.lbfgs_maxiter)
-
-# Optional retrain
-if cfg.do_optional_retrain:
-    print("\nRetrain on TRAIN+VAL (Dataset 2).")
-    X_tv_b = np.vstack([d_b["X_train_orig"], d_b["X_val_orig"]])
-    y_tv_b = np.vstack([d_b["y_train_orig"], d_b["y_val_orig"]])
-    sx_tv_b = StandardScaler().fit(X_tv_b)
-    sy_tv_b = StandardScaler().fit(y_tv_b)
-
-    tf.keras.backend.clear_session()
-    model_b = build_fn_b(best_hp_b)
-    try:
-        model_b.set_weights(ft_weights)
-    except Exception:
-        pass
-    X_tv_bs = sx_tv_b.transform(X_tv_b); y_tv_bs = sy_tv_b.transform(y_tv_b)
-    model_b.fit(X_tv_bs, y_tv_bs, epochs=best_epoch_b, batch_size=32,
-                callbacks=[callbacks.ReduceLROnPlateau(
-                    monitor="loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1)],
-                verbose=1)
-    model_b = lbfgs_refine(model_b, X_tv_bs, y_tv_bs, maxiter=cfg.lbfgs_maxiter)
-
-    d_b["scaler_X"] = sx_tv_b; d_b["scaler_y"] = sy_tv_b
-    d_b["X_train"] = sx_tv_b.transform(d_b["X_train_orig"])
-    d_b["X_val"] = sx_tv_b.transform(d_b["X_val_orig"])
-    d_b["X_test"] = sx_tv_b.transform(d_b["X_test_orig"])
-    d_b["y_train"] = sy_tv_b.transform(d_b["y_train_orig"])
-    d_b["y_val"] = sy_tv_b.transform(d_b["y_val_orig"])
-    d_b["y_test"] = sy_tv_b.transform(d_b["y_test_orig"])
-
-    y_pred_rt_b = sy_tv_b.inverse_transform(
-        model_b.predict(sx_tv_b.transform(d_b["X_test_orig"]), verbose=0)).reshape(-1)
-    y_true_rt_b = d_b["y_test_orig"].reshape(-1)
-    print(f"TEST (retrained): R2={r2_score(y_true_rt_b, y_pred_rt_b):.4f}  "
-          f"RMSE={np.sqrt(mean_squared_error(y_true_rt_b, y_pred_rt_b)):.4f}")
+model_b, history_b, best_epoch_b, d_b = run_final_training(
+    d_b, build_fn_b, best_hp_b, cfg.export_dir_b, init_weights=ft_weights_b)
 
 # Diagnostics
 diag_b = run_diagnostics(
     model_b, d_b, df_b, input_columns_b, cfg.export_dir_b,
     history_b, best_epoch_b, q2_b, best_hp_b, "Phase B (Dataset 2)",
-    n_transferred=n_transferred)
+    n_transferred=n_transferred_b)
 
 make_zip(cfg.export_dir_b, "dataset2_results.zip")
 
 print("\n" + "=" * 80)
-print("PHASE B COMPLETE. Model fine-tuned on Dataset 2.")
+print("PHASE B COMPLETE.")
 print("=" * 80)
 
 
@@ -1302,11 +1367,13 @@ if new_data_loaded and new_df is not None:
     try:
         _show(new_df.head())
         ncn = new_df.shape[1]
-        nl = new_df.iloc[:, :cfg.n_labels] if cfg.n_labels > 0 else pd.DataFrame()
-        if ncn < cfg.n_labels + cfg.n_inputs:
+        nl = (new_df.iloc[:, :cfg.n_labels_b]
+              if cfg.n_labels_b > 0 else pd.DataFrame())
+        if ncn < cfg.n_labels_b + cfg.n_inputs_b:
             raise ValueError(f"Too few columns: {ncn}")
-        ni = new_df.iloc[:, cfg.n_labels:cfg.n_labels + cfg.n_inputs]
-        if ni.shape[1] != n_features:
+        ni = new_df.iloc[:, cfg.n_labels_b:cfg.n_labels_b + cfg.n_inputs_b]
+        n_features_new = ni.shape[1]
+        if n_features_new != n_features_b:
             if set(ni.columns).issubset(set(input_columns_b)):
                 ni = ni[input_columns_b]
             else:
@@ -1329,9 +1396,9 @@ if new_data_loaded and new_df is not None:
         comp["PI_Calibration_Source"] = cfg.pi_calibration
 
         has_actual = False
-        if ncn > cfg.n_labels + cfg.n_inputs:
+        if ncn > cfg.n_labels_b + cfg.n_inputs_b:
             try:
-                ya = new_df.iloc[:, cfg.n_labels+cfg.n_inputs].values.reshape(-1, 1)
+                ya = new_df.iloc[:, cfg.n_labels_b+cfg.n_inputs_b].values.reshape(-1, 1)
                 if not np.isnan(ya).all():
                     if np.isnan(ya).any():
                         ya = SimpleImputer(strategy="mean").fit(
