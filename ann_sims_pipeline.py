@@ -17,8 +17,8 @@
 # 3. THREE-STAGE PROGRESSIVE UNFREEZING —
 #    Stage 1 (output-only):  freeze every Dense except the output layer.
 #    Stage 2 (last-N):       unfreeze the last N Dense layers.
-#    Stage 3 (full):         unfreeze everything, very low LR + cosine decay.
-#    Each stage uses ReduceLROnPlateau for adaptive scheduling.
+#    Stage 3 (full):         unfreeze everything, very low LR.
+#    Every stage uses ReduceLROnPlateau for adaptive scheduling.
 #
 # 4. UNIFIED STANDARDISATION — Every array entering the model is z-scored;
 #    inverse-transform is applied only when producing human-readable outputs.
@@ -259,18 +259,6 @@ def make_fixed_builder(n_feat, arch, kernel_regularizers=None):
         return model
     return build_model
 
-
-# =============================================================================
-#  COSINE DECAY SCHEDULE HELPER
-# =============================================================================
-def make_cosine_schedule(initial_lr, total_epochs, warmup_epochs=5):
-    """Returns a LearningRateScheduler callback with linear warmup + cosine."""
-    def schedule(epoch, lr):
-        if epoch < warmup_epochs:
-            return initial_lr * (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
-        return initial_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
-    return callbacks.LearningRateScheduler(schedule, verbose=0)
 
 
 # ============================================================
@@ -628,9 +616,9 @@ model_ft.fit(
 )
 _eval_model(model_ft, X_val, y_val, "after Stage 2")
 
-# --- Stage 3: Unfreeze everything, cosine decay, very low LR -----------------
+# --- Stage 3: Unfreeze everything, ReduceLROnPlateau, very low LR ------------
 print(f"\n--- Stage 3: full unfreeze ({cfg.ft_stage3_epochs} epochs, "
-      f"LR={cfg.ft_stage3_lr}, cosine decay) ---")
+      f"LR={cfg.ft_stage3_lr}, ReduceLROnPlateau) ---")
 for layer in model_ft.layers:
     layer.trainable = True
 
@@ -638,15 +626,14 @@ model_ft.compile(
     optimizer=keras.optimizers.Adam(learning_rate=cfg.ft_stage3_lr),
     loss="mse", metrics=["mae"],
 )
-cosine_cb = make_cosine_schedule(cfg.ft_stage3_lr, cfg.ft_stage3_epochs,
-                                  warmup_epochs=3)
 model_ft.fit(
     X_train, y_train, validation_data=(X_val, y_val),
     epochs=cfg.ft_stage3_epochs, batch_size=32,
     callbacks=[
         callbacks.EarlyStopping(monitor="val_loss", patience=12,
                                 restore_best_weights=True),
-        cosine_cb,
+        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                    patience=5, min_lr=1e-6, verbose=1),
     ],
     verbose=1,
 )
