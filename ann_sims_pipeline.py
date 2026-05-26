@@ -4,13 +4,14 @@
 #                                  +
 #  ANN-for-SIMS Single-Cell Evaluator (No-Leakage)
 #
-#  IMPROVEMENTS:
-#  1. Weight transfer with layer freezing: transferred (early) layers are
-#     frozen and only deeper layers train at a reduced learning rate.
-#     A two-phase fine-tune schedule optionally unfreezes all layers later.
-#  2. Unified StandardScaler pipeline: every piece of data (synthetic and
-#     real) is standardised before entering the model and inverse-
-#     transformed only at the very end for human-readable results.
+#  KEY DESIGN:
+#  - Single model builder used for BOTH synthetic pre-training and real data,
+#    guaranteeing architecture compatibility for weight transfer.
+#  - Tuner runs on synthetic data first to find architecture, then warmup model
+#    trains with that exact architecture. Weights transfer 1:1 to the real model.
+#  - Gradual unfreezing: freeze early layers, fine-tune deeper layers at low LR,
+#    then unfreeze all at very low LR with ReduceLROnPlateau.
+#  - All data (synthetic + real) standardised; inverse-transform at the end only.
 # =============================================================================
 
 # --- Dependency installation (Colab/Notebook/Script-friendly) ---
@@ -81,227 +82,6 @@ def _show(obj, n=5):
         print(obj.head(n) if hasattr(obj, "head") else obj)
 
 
-# ============================================================
-# PHASE 1: HILL PRE-TRAINING (Synthetic Model Warmup)
-# ============================================================
-print("\n" + "=" * 70)
-print("PHASE 1: HILL PRE-TRAINING (Synthetic Warmup)")
-print("=" * 70)
-
-# Configuration
-N_INPUTS = 10
-N_SYNTHETIC = 500
-HILL_V_MAX = 200
-HILL_K = 0.10
-HILL_N = 1.20
-HILL_X_MIN = 0.1
-HILL_X_MAX = 100
-RANDOM_SEED = 42
-PRETRAIN_EPOCHS = 50
-
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
-
-
-def _generate_hill_data(n_samples, n_features, v_max, k, n_hill, x_min, x_max):
-    X = np.random.uniform(x_min, x_max, (n_samples, n_features)).astype(np.float32)
-    x1 = X[:, 0]
-    y = v_max * (x1 ** n_hill) / (k ** n_hill + x1 ** n_hill)
-    y += np.random.normal(0, 0.05 * v_max, n_samples)
-    for i in range(1, min(n_features, 3)):
-        y += 0.05 * v_max * (X[:, i] - x_min) / (x_max - x_min)
-    return X, y.reshape(-1, 1)
-
-
-X_h, y_h = _generate_hill_data(
-    N_SYNTHETIC, N_INPUTS, HILL_V_MAX, HILL_K, HILL_N, HILL_X_MIN, HILL_X_MAX
-)
-
-# ── Standardise synthetic data (fit on full synthetic set) ───────────────────
-scaler_Xh = StandardScaler().fit(X_h)
-scaler_yh = StandardScaler().fit(y_h)
-X_h_scaled = scaler_Xh.transform(X_h)
-y_h_scaled = scaler_yh.transform(y_h)
-
-X_h_train, X_h_val, y_h_train, y_h_val = train_test_split(
-    X_h_scaled, y_h_scaled, test_size=0.2, random_state=RANDOM_SEED
-)
-
-print(f"Synthetic data standardised: X mean~{X_h_scaled.mean():.4f}, "
-      f"std~{X_h_scaled.std():.4f}")
-
-# ── Fixed warmup architecture (shared with tuning & main pipeline) ───────────
-WARMUP_ARCHITECTURE = [256, 512, 128, 64, 32]
-
-tf.keras.backend.clear_session()
-warmup_model = keras.Sequential([
-    layers.Input(shape=(N_INPUTS,)),
-    layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(1e-3),
-                 name="warmup_dense_0"),
-    layers.Dropout(0.2, name="warmup_drop_0"),
-    layers.Dense(512, activation="relu", kernel_regularizer=regularizers.l2(1e-3),
-                 name="warmup_dense_1"),
-    layers.Dropout(0.2, name="warmup_drop_1"),
-    layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(1e-3),
-                 name="warmup_dense_2"),
-    layers.Dropout(0.2, name="warmup_drop_2"),
-    layers.Dense(64, activation="relu", kernel_regularizer=regularizers.l2(1e-3),
-                 name="warmup_dense_3"),
-    layers.Dropout(0.2, name="warmup_drop_3"),
-    layers.Dense(32, activation="relu", kernel_regularizer=regularizers.l2(1e-3),
-                 name="warmup_dense_4"),
-    layers.Dropout(0.1, name="warmup_drop_4"),
-    layers.Dense(1, activation="linear", name="warmup_output"),
-])
-warmup_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-3), loss="mse")
-
-es = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-history_warmup = warmup_model.fit(
-    X_h_train, y_h_train,
-    validation_data=(X_h_val, y_h_val),
-    epochs=PRETRAIN_EPOCHS, batch_size=32,
-    callbacks=[es], verbose=1,
-)
-print("\nPHASE 1 DONE: warmup_model trained on standardised synthetic data.\n")
-
-
-# ============================================================
-# PHASE 2: FIXED HYPERMODEL + TUNING (On Synthetic Data)
-# ============================================================
-TUNER_TRIALS = 10
-TUNER_EPOCHS = 50
-
-X_train = X_h_train
-y_train = y_h_train
-X_val = X_h_val
-y_val = y_h_val
-
-
-def build_model_fixed(hp):
-    model = keras.Sequential()
-    model.add(layers.Input(shape=(X_train.shape[1],)))
-    l2_val = hp.Choice("l2_reg", [1e-4, 1e-3, 1e-2])
-    model.add(layers.Dense(256, activation="relu",
-                           kernel_regularizer=regularizers.l2(l2_val)))
-    model.add(layers.Dropout(hp.Float("dropout_0", 0.0, 0.3, step=0.05)))
-    model.add(layers.Dense(512, activation="relu",
-                           kernel_regularizer=regularizers.l2(l2_val)))
-    model.add(layers.Dropout(hp.Float("dropout_00", 0.0, 0.3, step=0.05)))
-    model.add(layers.Dense(128, activation="relu",
-                           kernel_regularizer=regularizers.l2(l2_val)))
-    model.add(layers.Dropout(hp.Float("dropout_1", 0.0, 0.3, step=0.05)))
-    model.add(layers.Dense(64, activation="relu",
-                           kernel_regularizer=regularizers.l2(l2_val)))
-    model.add(layers.Dropout(hp.Float("dropout_2", 0.0, 0.3, step=0.05)))
-    model.add(layers.Dense(32, activation="relu",
-                           kernel_regularizer=regularizers.l2(l2_val)))
-    model.add(layers.Dropout(hp.Float("dropout_3", 0.0, 0.2, step=0.05)))
-    model.add(layers.Dense(1, activation="linear"))
-    model.compile(
-        optimizer=keras.optimizers.Adam(
-            learning_rate=hp.Choice("lr", [1e-4, 5e-4, 1e-3, 5e-3])
-        ),
-        loss="mse", metrics=["mae"],
-    )
-    return model
-
-
-tuner = kt.RandomSearch(
-    build_model_fixed,
-    objective="val_loss",
-    max_trials=TUNER_TRIALS,
-    executions_per_trial=1,
-    directory="tuner_results",
-    project_name="ann_synthetic_pretrain",
-)
-tuner.search(
-    X_train, y_train,
-    validation_data=(X_val, y_val),
-    epochs=TUNER_EPOCHS, batch_size=32, verbose=1,
-)
-best_hp_synthetic = tuner.get_best_hyperparameters(1)[0]
-print("\nBest hyperparameters (synthetic pretrain tuning):")
-for k, v in best_hp_synthetic.values.items():
-    print(f"  {k}: {v}")
-print("PHASE 2 DONE: Best synthetic hyperparameters found.\n")
-
-
-# ============================================================
-# PHASE 3: WEIGHT TRANSFER WITH LAYER FREEZING
-# ============================================================
-print("=" * 70)
-print("PHASE 3: WEIGHT TRANSFER + LAYER FREEZING")
-print("=" * 70)
-
-_model_with_pretrain = None
-_n_frozen_layers = 0
-
-try:
-    model_for_transfer = build_model_fixed(best_hp_synthetic)
-
-    warmup_dense_layers = [
-        l for l in warmup_model.layers if isinstance(l, layers.Dense)
-    ]
-    target_dense_layers = [
-        l for l in model_for_transfer.layers if isinstance(l, layers.Dense)
-    ]
-
-    n_transferred = 0
-    for lw, lt in zip(warmup_dense_layers, target_dense_layers):
-        if not lw.weights or not lt.weights:
-            continue
-        if len(lw.weights) != len(lt.weights):
-            print(f"  Skip {lw.name}: weight tensor count mismatch")
-            continue
-        shapes_match = all(
-            ww.shape == wt.shape
-            for ww, wt in zip(lw.weights, lt.weights)
-        )
-        if shapes_match:
-            lt.set_weights(lw.get_weights())
-            lt.trainable = False
-            n_transferred += 1
-            print(f"  Transferred + FROZEN: {lw.name} -> {lt.name}")
-        else:
-            print(f"  Skip {lw.name}: shape mismatch "
-                  f"({[w.shape for w in lw.weights]} vs "
-                  f"{[w.shape for w in lt.weights]})")
-
-    _n_frozen_layers = n_transferred
-
-    if n_transferred > 0:
-        print(f"\n  {n_transferred} layer(s) transferred and frozen.")
-        _model_with_pretrain = model_for_transfer
-    else:
-        print("No compatible weights transferred (architecture mismatch).")
-
-except Exception as e:
-    print(f"Weight transfer failed: {e}")
-    traceback.print_exc()
-    _model_with_pretrain = None
-
-print("=" * 70 + "\n")
-
-
-# =============================================================================
-# ANN-for-SIMS: Optimized ANN Regression Pipeline (Single-Cell Version)
-# =============================================================================
-
-# ── Display helper (re-defined for safety) ───────────────────────────────────
-try:
-    get_ipython  # type: ignore
-    IN_NOTEBOOK = True
-except Exception:
-    IN_NOTEBOOK = False
-
-use_colab = False
-try:
-    from google.colab import files as colab_files  # type: ignore
-    use_colab = True
-except Exception:
-    pass
-
-
 # =============================================================================
 #  USER CONFIGURATION
 # =============================================================================
@@ -318,6 +98,17 @@ class PipelineConfig:
 
     disable_gpu: bool = True
 
+    # Synthetic pre-training
+    n_synthetic: int = 500
+    hill_v_max: float = 200
+    hill_k: float = 0.10
+    hill_n: float = 1.20
+    hill_x_min: float = 0.1
+    hill_x_max: float = 100
+    pretrain_epochs: int = 80
+    pretrain_tuner_trials: int = 15
+
+    # Main tuning & training
     tuner_trials: int = 15
     k_folds: int = 15
     random_seed: int = 42
@@ -327,18 +118,18 @@ class PipelineConfig:
 
     do_optional_retrain: bool = True
 
+    # Weight transfer & fine-tuning
+    n_layers_to_freeze: int = 2
+    finetune_lr: float = 5e-4
+    finetune_epochs: int = 50
+    unfreeze_all_after: bool = True
+    unfreeze_lr: float = 1e-4
+    unfreeze_epochs: int = 40
+
     pi_calibration: str = "val"
     pi_alpha: float = 0.05
 
     export_dir: str = "optimized_model"
-
-    # Fine-tuning schedule
-    freeze_transferred: bool = True
-    finetune_lr: float = 1e-4
-    finetune_epochs: int = 30
-    unfreeze_all_after: bool = True
-    unfreeze_lr: float = 5e-5
-    unfreeze_epochs: int = 20
 
     # 3D surface plot settings
     surface_grid_n: int = 35
@@ -380,14 +171,144 @@ if cfg.disable_gpu:
 
 
 # =============================================================================
-#  DATA LOADING
+#  UNIFIED MODEL BUILDER (used for BOTH synthetic and real data)
 # =============================================================================
+def make_model_builder(n_feat):
+    """Single model builder used across the entire pipeline."""
+    def build_model(hp):
+        model = keras.Sequential()
+        model.add(layers.Input(shape=(n_feat,)))
+        n_layers = hp.Int("num_layers", 2, 6, step=1)
+        l2_val = hp.Choice("l2_reg", [1e-4, 1e-3, 1e-2])
+        for i in range(n_layers):
+            units = hp.Int(f"units_{i}", 64, 512, step=64)
+            model.add(layers.Dense(
+                units, activation="relu",
+                kernel_regularizer=regularizers.l2(l2_val),
+            ))
+            model.add(layers.Dropout(
+                hp.Float(f"dropout_{i}", 0.0, 0.5, step=0.1)
+            ))
+        model.add(layers.Dense(1, activation="linear"))
+        model.compile(
+            optimizer=keras.optimizers.Adam(
+                learning_rate=hp.Choice("lr", [1e-4, 5e-4, 1e-3, 5e-3])
+            ),
+            loss="mse", metrics=["mae"],
+        )
+        return model
+    return build_model
+
+
+# ============================================================
+# PHASE 1: SYNTHETIC DATA GENERATION + STANDARDISATION
+# ============================================================
+print("\n" + "=" * 70)
+print("PHASE 1: HILL SYNTHETIC DATA GENERATION")
+print("=" * 70)
+
+
+def _generate_hill_data(n_samples, n_features, v_max, k, n_hill, x_min, x_max):
+    X = np.random.uniform(x_min, x_max, (n_samples, n_features)).astype(np.float32)
+    x1 = X[:, 0]
+    y = v_max * (x1 ** n_hill) / (k ** n_hill + x1 ** n_hill)
+    y += np.random.normal(0, 0.05 * v_max, n_samples)
+    for i in range(1, min(n_features, 3)):
+        y += 0.05 * v_max * (X[:, i] - x_min) / (x_max - x_min)
+    return X, y.reshape(-1, 1)
+
+
+X_h, y_h = _generate_hill_data(
+    cfg.n_synthetic, cfg.n_inputs, cfg.hill_v_max,
+    cfg.hill_k, cfg.hill_n, cfg.hill_x_min, cfg.hill_x_max,
+)
+
+# Standardise synthetic data
+scaler_Xh = StandardScaler().fit(X_h)
+scaler_yh = StandardScaler().fit(y_h)
+X_h_scaled = scaler_Xh.transform(X_h)
+y_h_scaled = scaler_yh.transform(y_h)
+
+X_h_train, X_h_val, y_h_train, y_h_val = train_test_split(
+    X_h_scaled, y_h_scaled, test_size=0.2, random_state=cfg.random_seed
+)
+
+print(f"Synthetic data: {X_h.shape[0]} samples, {X_h.shape[1]} features")
+print(f"Standardised: X mean~{X_h_scaled.mean():.4f}, std~{X_h_scaled.std():.4f}")
+
+
+# ============================================================
+# PHASE 2: TUNER ON SYNTHETIC DATA (finds best architecture)
+# ============================================================
+print("\n" + "=" * 70)
+print("PHASE 2: HYPERPARAMETER TUNING ON SYNTHETIC DATA")
+print("=" * 70)
+
+build_fn_synth = make_model_builder(cfg.n_inputs)
+
+tuner_synth = kt.RandomSearch(
+    build_fn_synth,
+    objective="val_loss",
+    max_trials=cfg.pretrain_tuner_trials,
+    executions_per_trial=1,
+    directory="tuner_results",
+    project_name="ann_synthetic_arch_search",
+)
+print(f"Tuning on synthetic data ({cfg.pretrain_tuner_trials} trials)...")
+tuner_synth.search(
+    X_h_train, y_h_train,
+    validation_data=(X_h_val, y_h_val),
+    epochs=cfg.tuner_epochs, batch_size=32, verbose=1,
+)
+
+best_hp_synth = tuner_synth.get_best_hyperparameters(1)[0]
+print("\nBest architecture (synthetic):")
+for k, v in best_hp_synth.values.items():
+    print(f"  {k}: {v}")
+
+
+# ============================================================
+# PHASE 3: TRAIN WARMUP MODEL WITH BEST ARCHITECTURE
+# ============================================================
+print("\n" + "=" * 70)
+print("PHASE 3: PRE-TRAINING WARMUP MODEL (best architecture from Phase 2)")
+print("=" * 70)
+
+tf.keras.backend.clear_session()
+warmup_model = build_fn_synth(best_hp_synth)
+
+es_warmup = callbacks.EarlyStopping(
+    monitor="val_loss", patience=10, restore_best_weights=True
+)
+rlr_warmup = callbacks.ReduceLROnPlateau(
+    monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5, verbose=1
+)
+
+history_warmup = warmup_model.fit(
+    X_h_train, y_h_train,
+    validation_data=(X_h_val, y_h_val),
+    epochs=cfg.pretrain_epochs, batch_size=32,
+    callbacks=[es_warmup, rlr_warmup], verbose=1,
+)
+
+warmup_val_loss = min(history_warmup.history["val_loss"])
+print(f"\nPHASE 3 DONE: warmup model trained. Best val_loss={warmup_val_loss:.6f}")
+print(f"Architecture: {best_hp_synth.values}")
+
+
+# =============================================================================
+#  DATA LOADING (Real SIMS data)
+# =============================================================================
+print("\n" + "=" * 70)
+print("LOADING REAL SIMS DATA")
+print("=" * 70)
+
+
 def load_table(path, sep="\t"):
     _, ext = os.path.splitext(path.lower())
     if ext in (".xlsx", ".xls", ".xlsm"):
         print(f"Detected Excel file: {path}")
         return pd.read_excel(path, engine="openpyxl")
-
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
     last_err = None
     for enc in encodings:
@@ -455,7 +376,7 @@ row_pos = np.arange(len(df))
 
 
 # =============================================================================
-#  TRAIN / VAL / TEST SPLIT  (on raw, unstandardised data)
+#  TRAIN / VAL / TEST SPLIT
 # =============================================================================
 test_frac = cfg.test_percent / 100.0
 val_frac = cfg.val_percent / 100.0
@@ -498,48 +419,20 @@ y_val = scaler_y.transform(y_val_orig)
 y_test = scaler_y.transform(y_test_orig)
 
 n_features = X_train.shape[1]
-print(f"\nStandardisation complete (fit on TRAIN only).")
+print(f"\nStandardisation (fit on TRAIN only):")
 print(f"  X_train: mean={X_train.mean():.6f}, std={X_train.std():.6f}")
 print(f"  y_train: mean={y_train.mean():.6f}, std={y_train.std():.6f}")
-print(f"  X_val:   mean={X_val.mean():.6f}, std={X_val.std():.6f}")
-print(f"  X_test:  mean={X_test.mean():.6f}, std={X_test.std():.6f}")
 
 
 # =============================================================================
-#  MODEL BUILDER (closure)
+#  KERAS-TUNER ON REAL DATA (same model builder as synthetic)
 # =============================================================================
-def make_model_builder(n_feat):
-    def build_model(hp):
-        model = keras.Sequential()
-        model.add(layers.Input(shape=(n_feat,)))
-        n_layers = hp.Int("num_layers", 2, 6, step=1)
-        l2_val = hp.Choice("l2_reg", [1e-4, 1e-3, 1e-2])
-        for i in range(n_layers):
-            units = hp.Int(f"units_{i}", 64, 512, step=64)
-            model.add(layers.Dense(
-                units, activation="relu",
-                kernel_regularizer=regularizers.l2(l2_val),
-            ))
-            model.add(layers.Dropout(
-                hp.Float(f"dropout_{i}", 0.0, 0.5, step=0.1)
-            ))
-        model.add(layers.Dense(1, activation="linear"))
-        model.compile(
-            optimizer=keras.optimizers.Adam(
-                learning_rate=hp.Choice("lr", [1e-4, 5e-4, 1e-3, 5e-3])
-            ),
-            loss="mse", metrics=["mae"],
-        )
-        return model
-    return build_model
-
+print("\n" + "=" * 70)
+print("HYPERPARAMETER TUNING ON REAL DATA")
+print("=" * 70)
 
 build_fn = make_model_builder(n_features)
 
-
-# =============================================================================
-#  KERAS-TUNER SEARCH  (all data already standardised)
-# =============================================================================
 tuner = kt.RandomSearch(
     build_fn,
     objective="val_loss",
@@ -553,99 +446,95 @@ tuner.search(X_train, y_train, validation_data=(X_val, y_val),
              epochs=cfg.tuner_epochs, batch_size=32, verbose=1)
 
 best_hp = tuner.get_best_hyperparameters(1)[0]
-print("Best hyperparameters:")
+print("\nBest hyperparameters (real data):")
 for k, v in best_hp.values.items():
     print(f"  {k}: {v}")
 
 
 # =============================================================================
-#  WEIGHT TRANSFER WITH FREEZING + LOW-LR FINE-TUNING
+#  WEIGHT TRANSFER WITH PARTIAL FREEZING + GRADUAL UNFREEZE
 # =============================================================================
 print("\n" + "=" * 70)
-print("WEIGHT TRANSFER: Freeze early layers + low-LR fine-tune")
+print("WEIGHT TRANSFER: warmup -> real model (partial freeze + fine-tune)")
 print("=" * 70)
 
 _pretrained_model = None
 
+tf.keras.backend.clear_session()
+model_transfer = build_fn(best_hp)
 
-def _transfer_and_freeze(source_model, target_model, freeze=True):
-    """Transfer compatible Dense weights and optionally freeze them."""
-    src_dense = [l for l in source_model.layers if isinstance(l, layers.Dense)]
-    tgt_dense = [l for l in target_model.layers if isinstance(l, layers.Dense)]
+# Get Dense layers from both models
+warmup_dense = [l for l in warmup_model.layers if isinstance(l, layers.Dense)]
+target_dense = [l for l in model_transfer.layers if isinstance(l, layers.Dense)]
 
-    n_transferred = 0
-    frozen_names = []
-    for ls, lt in zip(src_dense, tgt_dense):
-        if not ls.weights or not lt.weights:
-            continue
-        if len(ls.weights) != len(lt.weights):
-            print(f"  Skip {ls.name}->{lt.name}: tensor count mismatch")
-            continue
-        shapes_ok = all(
-            ws.shape == wt.shape
-            for ws, wt in zip(ls.weights, lt.weights)
-        )
-        if shapes_ok:
-            lt.set_weights(ls.get_weights())
-            if freeze:
-                lt.trainable = False
-                frozen_names.append(lt.name)
-            n_transferred += 1
-            status = "FROZEN" if freeze else "trainable"
-            print(f"  {ls.name} -> {lt.name}  [{status}]")
-        else:
-            print(f"  Skip {ls.name}->{lt.name}: shape mismatch")
+n_transferred = 0
+transferred_layer_names = []
 
-    return n_transferred, frozen_names
-
-
-if _model_with_pretrain is not None:
-    target = build_fn(best_hp)
-    n_ok, frozen = _transfer_and_freeze(
-        _model_with_pretrain, target, freeze=cfg.freeze_transferred
+for lw, lt in zip(warmup_dense, target_dense):
+    if not lw.weights or not lt.weights:
+        continue
+    if len(lw.weights) != len(lt.weights):
+        print(f"  Skip {lw.name}->{lt.name}: tensor count mismatch")
+        continue
+    shapes_ok = all(
+        ws.shape == wt.shape for ws, wt in zip(lw.weights, lt.weights)
     )
-    if n_ok > 0:
-        _pretrained_model = target
-        print(f"\n  {n_ok} layer(s) transferred. "
-              f"Frozen: {frozen if frozen else 'none'}")
+    if shapes_ok:
+        lt.set_weights(lw.get_weights())
+        n_transferred += 1
+        transferred_layer_names.append(lt.name)
+        print(f"  Transferred: {lw.name} -> {lt.name} "
+              f"(shapes: {[w.shape for w in lt.weights]})")
     else:
-        print("No compatible weights for transfer.")
-elif "warmup_model" in globals():
-    print("Using warmup_model for weight transfer...")
-    target = build_fn(best_hp)
-    n_ok, frozen = _transfer_and_freeze(
-        warmup_model, target, freeze=cfg.freeze_transferred
-    )
-    if n_ok > 0:
-        _pretrained_model = target
-        print(f"\n  {n_ok} layer(s) transferred. "
-              f"Frozen: {frozen if frozen else 'none'}")
-    else:
-        print("No compatible weights (architecture mismatch).")
+        print(f"  Skip {lw.name}->{lt.name}: shape mismatch "
+              f"({[w.shape for w in lw.weights]} vs {[w.shape for w in lt.weights]})")
+
+print(f"\nTotal layers transferred: {n_transferred}/{len(target_dense)}")
+
+# Freeze the first N transferred layers (not all)
+n_to_freeze = min(cfg.n_layers_to_freeze, n_transferred)
+frozen_names = []
+if n_to_freeze > 0 and n_transferred > 0:
+    freeze_count = 0
+    for layer in model_transfer.layers:
+        if isinstance(layer, layers.Dense) and layer.name in transferred_layer_names:
+            if freeze_count < n_to_freeze:
+                layer.trainable = False
+                frozen_names.append(layer.name)
+                freeze_count += 1
+    print(f"Frozen {len(frozen_names)} early layer(s): {frozen_names}")
+
+if n_transferred > 0:
+    _pretrained_model = model_transfer
+    print("Weight transfer successful.")
 else:
-    print("No pre-trained model available for weight transfer.")
+    print("No weights transferred. Model will train from scratch.")
+    _pretrained_model = None
 
-# ── Fine-tune phase 1: train only unfrozen layers at low LR ─────────────────
-if _pretrained_model is not None and cfg.freeze_transferred:
-    print(f"\nFine-tune phase 1: {cfg.finetune_epochs} epochs, "
-          f"LR={cfg.finetune_lr} (frozen layers kept)")
+# ── Fine-tune phase 1: low LR, frozen early layers ──────────────────────────
+if _pretrained_model is not None and frozen_names:
+    print(f"\nFine-tune Phase 1: {cfg.finetune_epochs} epochs, "
+          f"LR={cfg.finetune_lr} (early layers frozen)")
     _pretrained_model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=cfg.finetune_lr),
         loss="mse", metrics=["mae"],
     )
-    es_ft = callbacks.EarlyStopping(
+    es_ft1 = callbacks.EarlyStopping(
         monitor="val_loss", patience=10, restore_best_weights=True
+    )
+    rlr_ft1 = callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5, verbose=1
     )
     _pretrained_model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=cfg.finetune_epochs, batch_size=32,
-        callbacks=[es_ft], verbose=1,
+        callbacks=[es_ft1, rlr_ft1], verbose=1,
     )
 
-    # ── Fine-tune phase 2: unfreeze all, very low LR ────────────────────────
+    # ── Fine-tune phase 2: unfreeze all layers, very low LR ─────────────────
     if cfg.unfreeze_all_after:
-        print(f"\nFine-tune phase 2: unfreeze all, {cfg.unfreeze_epochs} epochs, "
+        print(f"\nFine-tune Phase 2: unfreeze all, {cfg.unfreeze_epochs} epochs, "
               f"LR={cfg.unfreeze_lr}")
         for layer in _pretrained_model.layers:
             layer.trainable = True
@@ -656,19 +545,22 @@ if _pretrained_model is not None and cfg.freeze_transferred:
         es_ft2 = callbacks.EarlyStopping(
             monitor="val_loss", patience=10, restore_best_weights=True
         )
+        rlr_ft2 = callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1
+        )
         _pretrained_model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=cfg.unfreeze_epochs, batch_size=32,
-            callbacks=[es_ft2], verbose=1,
+            callbacks=[es_ft2, rlr_ft2], verbose=1,
         )
-    print("Fine-tuning complete.")
+    print("Fine-tuning complete.\n")
 
 print("=" * 70 + "\n")
 
 
 # =============================================================================
-#  STRICT NO-LEAKAGE CV INSIDE TRAIN  (standardised data throughout)
+#  STRICT NO-LEAKAGE CV INSIDE TRAIN
 # =============================================================================
 kf = KFold(n_splits=cfg.k_folds, shuffle=True, random_state=cfg.random_seed)
 
@@ -698,11 +590,14 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_orig), start=1):
     es_cv = callbacks.EarlyStopping(
         monitor="val_loss", patience=10, restore_best_weights=True
     )
+    rlr_cv = callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5, verbose=0
+    )
     model_fold.fit(
         X_tr_s, y_tr_s,
         validation_data=(X_va_s, y_va_s),
         epochs=cfg.cv_epochs, batch_size=32,
-        callbacks=[es_cv], verbose=1,
+        callbacks=[es_cv, rlr_cv], verbose=1,
     )
 
     va_pred = fold_sy.inverse_transform(
@@ -735,7 +630,7 @@ print(f"Predicted R2 (Q2, OOF/PRESS): {pred_R2_train:.4f}")
 
 
 # =============================================================================
-#  FINAL TRAINING (TRAIN -> validate on VAL) -- standardised throughout
+#  FINAL TRAINING (TRAIN -> validate on VAL)
 # =============================================================================
 print("\nFinal training: fit on TRAIN (standardised), validate on VAL.")
 
@@ -747,6 +642,9 @@ mc = callbacks.ModelCheckpoint(
 )
 es_final = callbacks.EarlyStopping(
     monitor="val_loss", patience=20, restore_best_weights=True
+)
+rlr_final = callbacks.ReduceLROnPlateau(
+    monitor="val_loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1
 )
 
 tf.keras.backend.clear_session()
@@ -763,7 +661,7 @@ history = model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
     epochs=cfg.final_epochs, batch_size=32,
-    callbacks=[es_final, mc], verbose=1,
+    callbacks=[es_final, mc, rlr_final], verbose=1,
 )
 
 if os.path.exists(ckpt_path):
@@ -772,8 +670,8 @@ if os.path.exists(ckpt_path):
 best_epoch = int(np.argmin(history.history["val_loss"]) + 1)
 print(f"Best epoch (by VAL loss): {best_epoch}")
 
-# Evaluate once on TEST -- inverse-transform for human-readable metrics
-print("\nEvaluating once on TEST (inverse-transformed).")
+# Evaluate on TEST (inverse-transformed)
+print("\nEvaluating on TEST (inverse-transformed).")
 y_test_pred_eval = scaler_y.inverse_transform(
     model.predict(X_test, verbose=0)
 ).reshape(-1)
@@ -784,7 +682,7 @@ print(f"TEST: R2={r2_score(y_test_inv_eval, y_test_pred_eval):.4f}  "
 
 
 # =============================================================================
-#  OPTIONAL RETRAIN ON TRAIN+VAL  (re-fit scalers, standardise, train, invert)
+#  OPTIONAL RETRAIN ON TRAIN+VAL
 # =============================================================================
 if cfg.do_optional_retrain:
     print("\nOptional retrain: refit scalers on TRAIN+VAL, retrain, evaluate TEST.")
@@ -799,7 +697,17 @@ if cfg.do_optional_retrain:
 
     tf.keras.backend.clear_session()
     model_rt = build_fn(best_hp)
-    model_rt.fit(X_tv_s, y_tv_s, epochs=best_epoch, batch_size=32, verbose=1)
+    if _pretrained_model is not None:
+        try:
+            model_rt.set_weights(_pretrained_model.get_weights())
+        except Exception:
+            pass
+
+    rlr_rt = callbacks.ReduceLROnPlateau(
+        monitor="loss", factor=0.5, patience=8, min_lr=1e-6, verbose=1
+    )
+    model_rt.fit(X_tv_s, y_tv_s, epochs=best_epoch, batch_size=32,
+                 callbacks=[rlr_rt], verbose=1)
 
     y_pred_rt = scaler_y_tv.inverse_transform(
         model_rt.predict(scaler_X_tv.transform(X_test_orig), verbose=0)
@@ -870,7 +778,7 @@ print(f"Model and scalers saved to {cfg.export_dir}/")
 
 
 # =============================================================================
-#  PREDICTIONS -- inverse-transform for all final results
+#  PREDICTIONS (inverse-transformed for all results)
 # =============================================================================
 y_train_pred = scaler_y.inverse_transform(model.predict(X_train, verbose=0))
 y_val_pred = scaler_y.inverse_transform(model.predict(X_val, verbose=0))
@@ -881,7 +789,7 @@ y_test_inv = scaler_y.inverse_transform(y_test)
 
 
 # =============================================================================
-#  METRICS  (all computed on inverse-transformed values)
+#  METRICS (all on inverse-transformed values)
 # =============================================================================
 def compute_basic_metrics(y_true, y_pred):
     actual = np.asarray(y_true).reshape(-1)
@@ -925,7 +833,7 @@ for label, pct, m in [("Training", cfg.train_percent, m_train),
     for k, v in m.items():
         print(f"  {k}: {v}")
 
-# Save statistics file
+# Save statistics
 stats_path = os.path.join(cfg.export_dir, "model_statistics.txt")
 try:
     with open(stats_path, "w", encoding="utf-8") as fh:
@@ -934,12 +842,12 @@ try:
         fh.write(f"Number of predictors (p): {p}\n")
         fh.write(f"Data split: {cfg.train_percent}% / {cfg.val_percent}% / "
                  f"{cfg.test_percent}%\n\n")
-        fh.write("Hyperparameters (best):\n")
+        fh.write("Hyperparameters (best, real data):\n")
         for k, v in best_hp.values.items():
             fh.write(f"  {k}: {v}\n")
-        fh.write(f"\nWeight transfer: freeze={cfg.freeze_transferred}, "
-                 f"finetune_lr={cfg.finetune_lr}, "
-                 f"unfreeze_lr={cfg.unfreeze_lr}\n")
+        fh.write(f"\nWeight transfer: n_frozen={cfg.n_layers_to_freeze}, "
+                 f"finetune_lr={cfg.finetune_lr}, unfreeze_lr={cfg.unfreeze_lr}\n")
+        fh.write(f"Layers transferred: {n_transferred}, frozen: {frozen_names}\n")
         for label, pct, m in [("Training", cfg.train_percent, m_train),
                                ("Validation", cfg.val_percent, m_val),
                                ("Test", cfg.test_percent, m_test)]:
@@ -1066,7 +974,7 @@ except Exception as e:
 
 
 # =============================================================================
-#  EXPORT DataFrames  (all values inverse-transformed)
+#  EXPORT DataFrames (inverse-transformed)
 # =============================================================================
 def make_export_df(lbl, inp, y_true, y_pred):
     actual = np.asarray(y_true).reshape(-1)
@@ -1157,7 +1065,7 @@ _show(results_test.head())
 
 
 # =============================================================================
-#  3D SURFACE PLOTS (all pairs)
+#  3D SURFACE PLOTS
 # =============================================================================
 def _build_ref_vector(X_orig, hold_mode, row_idx=0):
     if hold_mode == "median_train":
@@ -1315,13 +1223,13 @@ except Exception as e:
 
 
 # =============================================================================
-#  NEW DATA PREDICTION  (standardise -> predict -> inverse-transform)
+#  NEW DATA PREDICTION (standardise -> predict -> inverse-transform)
 # =============================================================================
 print("\n" + "=" * 80)
 print("NEW DATA PREDICTION SECTION")
 print("=" * 80)
 
-# Calibration residuals for PI (computed on inverse-transformed values)
+# Calibration residuals for PI
 if cfg.pi_calibration == "val":
     cal_res = y_val_inv.reshape(-1) - y_val_pred.reshape(-1)
 elif cfg.pi_calibration == "oof":
@@ -1394,7 +1302,7 @@ if new_data_loaded and new_df is not None:
         new_X = new_inputs.values
         print(f"Generating predictions for {len(new_X)} samples...")
 
-        # Standardise new data with the same scaler, predict, inverse-transform
+        # Standardise -> predict -> inverse-transform
         new_X_scaled = scaler_X.transform(new_X)
         new_y_pred = scaler_y.inverse_transform(
             model.predict(new_X_scaled, verbose=0)
@@ -1418,7 +1326,6 @@ if new_data_loaded and new_df is not None:
         compact["PI_Width"] = pi_upper - pi_lower
         compact["PI_Calibration_Source"] = cfg.pi_calibration
 
-        # If actual values exist
         has_actual = False
         if n_cols_new > cfg.n_labels + cfg.n_inputs:
             try:
