@@ -834,7 +834,7 @@ def snapshot_weights(model):
     for layer in model.layers:
         if isinstance(layer, layers.Dense) and layer.weights:
             per_layer[layer.name] = [w.numpy() for w in layer.weights]
-    full = [w.numpy() for w in model.get_weights()]
+    full = [np.array(w) for w in model.get_weights()]
     return per_layer, full
 
 
